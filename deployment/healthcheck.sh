@@ -9,7 +9,7 @@ set -euo pipefail
 
 BASE_URL="${TPU_HEALTHCHECK_URL:-http://127.0.0.1:8188}"
 
-body="$(curl -fsS --max-time 10 "$BASE_URL/tpu/status" 2>/dev/null || true)"
+body="$(curl -sS --max-time 10 "$BASE_URL/tpu/status" 2>/dev/null || true)"
 if [ -z "$body" ]; then
   echo "TPU healthcheck: /tpu/status unreachable" >&2
   exit 1

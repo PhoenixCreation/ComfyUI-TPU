@@ -139,8 +139,6 @@ class XlaAccelerator:
         self._runtime = xr
         self._xla_model = xm
         self._spmd = xs
-        self.device = xm.xla_device()
-        self._initialized = True
 
     def _validate_devices(self):
         try:
@@ -160,6 +158,12 @@ class XlaAccelerator:
             self._runtime.use_spmd()
         except AttributeError as e:
             raise RuntimeError("installed torch-xla does not expose runtime.use_spmd(); upgrade to the pinned release") from e
+        # SPMD must be enabled before the first logical XLA device is created.
+        # Initializing xla:0 first makes torch-xla migrate already-created
+        # tensors into the virtual SPMD device and can crash PJRT when the
+        # first large sharded transfer is executed.
+        self.device = self._xla_model.xla_device()
+        self._initialized = True
         device_ids = list(range(DEVICE_COUNT))
         self.mesh = self._spmd.Mesh(device_ids, MESH_SHAPE, MESH_AXIS_NAMES)
         self.mesh_device_ids = device_ids
@@ -261,33 +265,24 @@ class XlaAccelerator:
         report = self._sharding_reports.setdefault(policy.artifact, tpu_sharding.ShardingReport(policy))
         sharded = 0
         replicated = 0
+        # Use PyTorch/XLA's native module transfer. Replacing CPU Parameter
+        # storage with an XLA tensor via ``.data`` or ``swap_tensors`` is not a
+        # supported cross-device operation and can crash PJRT during the first
+        # replicated execution.
+        module.to(self.device)
         for name, param in module.named_parameters():
-            if param.device.type == "xla":
-                continue
             spec = policy.spec_for(name, tuple(param.shape))
             if policy.partition_dim(spec, tuple(param.shape)) is not None:
                 sharded += 1
             else:
                 replicated += 1
-            self._materialize(param, name, spec, policy, report)
+            self._spmd.mark_sharding(param, self.mesh, _runtime_mesh_spec(policy.mesh_spec(spec, len(param.shape))))
+            report.add(name, tuple(param.shape), str(param.dtype))
         for name, buf in module.named_buffers():
-            if buf.device.type == "xla":
-                continue
             spec = policy.spec_for(name, tuple(buf.shape))
-            self._materialize(buf, name, spec, policy, report)
+            self._spmd.mark_sharding(buf, self.mesh, _runtime_mesh_spec(policy.mesh_spec(spec, len(buf.shape))))
+            report.add(name, tuple(buf.shape), str(buf.dtype))
         return {"sharded": sharded, "replicated": replicated}
-
-    def _materialize(self, tensor, name, spec, policy, report):
-        """Replace ``tensor``'s data with an annotated XLA tensor copied from
-        the current host value, then drop the host value."""
-        host_value = tensor.data
-        target = torch.empty(tensor.shape, dtype=tensor.dtype, device=self.device)
-        mesh_spec = policy.mesh_spec(spec, len(tensor.shape))
-        self._spmd.mark_sharding(target, self.mesh, _runtime_mesh_spec(mesh_spec))
-        target.copy_(host_value)
-        tensor.data = target
-        report.add(name, tuple(tensor.shape), str(tensor.dtype))
-        del host_value
 
     def _mark(self, param, spec, report, name, dtype, policy=None):
         param.data = torch.empty(param.shape, dtype=dtype, device=self.device)
@@ -321,7 +316,7 @@ class XlaAccelerator:
             if mem is not None:
                 info["xla_current_bytes"] = mem.get("current", 0)
                 info["xla_peak_bytes"] = mem.get("peak", 0)
-        except (AttributeError, NotImplementedError):
+        except (AttributeError, NotImplementedError, RuntimeError):
             pass
         return info
 

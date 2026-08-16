@@ -678,7 +678,10 @@ class TransformerBlock(nn.Module):
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
-        x = torch.add(residual, x, out=output)
+        if comfy.model_management.xla_enabled():
+            x = residual + x
+        else:
+            x = torch.add(residual, x, out=output)
 
         return x, present_key_value
 
@@ -743,7 +746,10 @@ class TransformerBlockGemma2(nn.Module):
         x = self.pre_feedforward_layernorm(x)
         x = self.mlp(x)
         x = self.post_feedforward_layernorm(x)
-        x = torch.add(residual, x, out=output)
+        if comfy.model_management.xla_enabled():
+            x = residual + x
+        else:
+            x = torch.add(residual, x, out=output)
 
         return x, present_key_value
 

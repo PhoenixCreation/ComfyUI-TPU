@@ -10,8 +10,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 import comfy.model_management
+import comfy.accelerator
 import comfy.patcher_extension
 import comfy.ldm.common_dit
 import comfy.utils
@@ -367,6 +369,12 @@ class SingleStreamDiT(nn.Module):
         for i, block in enumerate(self.blocks):
             transformer_options["block_index"] = i
             combined = block(combined, tvec, freqs, None, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
+            if comfy.model_management.xla_enabled():
+                # A full 1920x1080 Krea2 pass exceeds v5e HBM as one XLA
+                # program. Blocks share the same activation contract, so each
+                # boundary can reuse a small compiled program while releasing
+                # the previous block's attention temporaries.
+                comfy.accelerator.mark_step()
 
         final = self.last(combined, t)
         del combined

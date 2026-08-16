@@ -39,12 +39,22 @@ simpleeval>=1.0.0
 blake3
 huggingface-hub
 opencv-python-headless
+kornia==0.8.3
+spandrel==0.4.2
+pydantic-settings==2.15.0
+PyOpenGL==3.1.10
+comfy-angle==0.1.0
+comfy-kitchen==0.2.31
+comfy-aimdo==0.4.13
+torchsde==0.2.6
+pytest==9.1.1
 
 # --- ComfyUI frontend / templates (pinned to the repo requirements.txt) ---
 comfyui-frontend-package==1.49.6
 comfyui-workflow-templates==0.11.41
 comfyui-embedded-docs==0.5.10
 
-# Not installed: torchsde (SDE samplers only; the er_sde profile does not use
-# it) and comfy-kitchen / comfy-aimdo (optional accelerator packages; every
-# import site degrades gracefully when absent).
+# The Krea2 profile uses the eager comfy-kitchen backend on TPU. comfy-aimdo
+# is installed for the ComfyUI dependency contract but is disabled by the TPU
+# launcher. torchsde is not required by er_sde, but pinning it keeps the whole
+# sampler dependency set reproducible.

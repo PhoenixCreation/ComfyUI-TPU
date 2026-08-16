@@ -545,7 +545,31 @@ def run_tpu_warmup(prompt_server):
             return
 
         counters_before = comfy.accelerator.compile_counters()
-        executor = execution.PromptExecutor(prompt_server)
+        cache_ram = min(10.0, max(2.0, comfy.model_management.total_ram * 0.10 / 1024.0))
+        cache_ram_inactive = min(128.0, comfy.model_management.total_ram / 1024.0)
+        if len(args.cache_ram) > 0:
+            cache_ram = args.cache_ram[0]
+        if len(args.cache_ram) > 1:
+            cache_ram_inactive = args.cache_ram[1]
+        cache_type = execution.CacheType.RAM_PRESSURE
+        if args.cache_classic:
+            cache_type = execution.CacheType.CLASSIC
+        elif args.cache_lru > 0:
+            cache_type = execution.CacheType.LRU
+        elif args.cache_none:
+            cache_type = execution.CacheType.NONE
+        try:
+            executor = execution.PromptExecutor(
+                prompt_server,
+                cache_type=cache_type,
+                cache_args={"lru": args.cache_lru, "ram": cache_ram, "ram_inactive": cache_ram_inactive},
+            )
+        except TypeError as error:
+            # Keep lightweight headless test doubles and older integrations
+            # working while production uses the configured cache policy.
+            if "unexpected keyword argument" not in str(error):
+                raise
+            executor = execution.PromptExecutor(prompt_server)
         orig_output = folder_paths.get_output_directory()
         warmup_output = os.path.join(folder_paths.get_temp_directory(), "warmup_output")
         os.makedirs(warmup_output, exist_ok=True)
@@ -558,7 +582,11 @@ def run_tpu_warmup(prompt_server):
         shutil.rmtree(warmup_output, ignore_errors=True)
 
         if not executor.success:
-            messages = " ".join(str(m.get("message", m)) for m in executor.status_messages)
+            def status_text(item):
+                data = item[1] if isinstance(item, tuple) and len(item) == 2 else item
+                return str(data.get("message", data)) if isinstance(data, dict) else str(data)
+
+            messages = " ".join(status_text(item) for item in executor.status_messages)
             readiness.fail("warm-up execution failed: {}".format(messages or "unknown execution error"))
             return
 

@@ -35,7 +35,10 @@ def _apply_rope1(x: Tensor, freqs_cis: Tensor):
         freqs_cis = freqs_cis[:, :, :x_.shape[2]]
 
     x_out = freqs_cis[..., 0] * x_[..., 0]
-    x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
+    if comfy.model_management.xla_enabled():
+        x_out = x_out + freqs_cis[..., 1] * x_[..., 1]
+    else:
+        x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
 
     return x_out.reshape(*x.shape).type_as(x)
 
@@ -45,14 +48,14 @@ def _apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor):
 
 
 def apply_rope(xq, xk, freqs_cis):
-    if comfy.model_management.in_training:
+    if comfy.model_management.in_training or comfy.model_management.xla_enabled():
         return _apply_rope(xq, xk, freqs_cis)
     else:
         return comfy.quant_ops.ck.apply_rope(xq, xk, freqs_cis)
 
 
 def apply_rope1(x, freqs_cis):
-    if comfy.model_management.in_training:
+    if comfy.model_management.in_training or comfy.model_management.xla_enabled():
         return _apply_rope1(x, freqs_cis)
     else:
         return comfy.quant_ops.ck.apply_rope1(x, freqs_cis)

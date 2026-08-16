@@ -1142,7 +1142,8 @@ class ModelPatcher:
         mutation_report = []
         if self.patches:
             mutation_report.append("weight patches (LoRA/weight patch nodes)")
-        if self.object_patches:
+        unsupported_object_patches = set(self.object_patches) - {"manual_cast_dtype", "model_sampling"}
+        if unsupported_object_patches:
             mutation_report.append("object patches")
         if self.weight_wrapper_patches:
             mutation_report.append("weight wrapper patches")
@@ -1155,6 +1156,23 @@ class ModelPatcher:
                 "TPU mode does not support model mutations for the Krea2 profile: {}. "
                 "Load the model without LoRA/patcher/hook nodes; TPU placement is process-wide.".format(
                     ", ".join(mutation_report)))
+
+        # TPU mode intentionally keeps the Qwen text encoder on its selected
+        # CPU device. Loading it onto XLA alongside the denoiser raises the
+        # 1920x1080 denoising program above the v5e-8 per-chip HBM limit.
+        # The weights were already populated on the host by the standard
+        # safetensors loader, so no device transfer is needed here.
+        if torch.device(device_to).type != "xla":
+            self.model.device = device_to
+            self.model.model_loaded_weight_memory = self.model_size()
+            self.model.model_offload_buffer_memory = 0
+            self.model.model_lowvram = False
+            self.model.lowvram_patch_counter = 0
+            self.model.current_weight_patches_uuid = None
+            logging.info(
+                "TPU host model retained: %s -> %s (kept off HBM)",
+                self.model.__class__.__name__, device_to)
+            return self.model
 
         artifact = getattr(self, "tpu_artifact", None)
         parent = self.parent

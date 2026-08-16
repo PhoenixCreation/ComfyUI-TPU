@@ -6,8 +6,10 @@
 #   deployment/launch.sh
 #
 # Prerequisites:
-#   - models staged under models/ and digests pinned:
+#   - models staged under models/ (deployment/stage_models.sh)
+#   - digests pinned in deployment/model_manifest.json. Run
 #       python deployment/hash_artifacts.py
+#     only when changing artifacts or creating a new deployment.
 #   - a writable persistent cache directory (the fingerprint-separated XLA
 #     executable cache lives here; see changes.md for the TPU write-only
 #     caveat on torch-xla 2.8.0)
