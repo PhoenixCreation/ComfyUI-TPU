@@ -1253,7 +1253,8 @@ class CFGGuider:
             try:
                 noise = noise.to(device=device, dtype=torch.float32)
                 latent_image = latent_image.to(device=device, dtype=torch.float32)
-                sigmas = sigmas.to(device)
+                if not comfy.model_management.xla_enabled():
+                    sigmas = sigmas.to(device)
                 cast_to_load_options(self.model_options, device=device, dtype=self.model_patcher.model_dtype())
 
                 self.model_patcher.pre_run()
@@ -1350,6 +1351,13 @@ def sample(model, noise, positive, negative, cfg, device, sampler, sigmas, model
     cfg_guider = CFGGuider(model)
     cfg_guider.set_conds(positive, negative)
     cfg_guider.set_cfg(cfg)
+    if comfy.model_management.xla_enabled():
+        with comfy.accelerator.stage_timer("denoising"):
+            samples = cfg_guider.sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
+        # TPU boundary (spec section 12): drain the denoising section before
+        # the latent is consumed by the VAE/decode trace.
+        comfy.accelerator.mark_step()
+        return samples
     return cfg_guider.sample(noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed)
 
 
@@ -1430,14 +1438,18 @@ class KSampler:
 
     def set_steps(self, steps, denoise=None):
         self.steps = steps
+        # TPU: sigmas stay host-side so the er_sde endpoint check
+        # (if sigmas[i + 1] == 0) and all scalar sigma math run on the host;
+        # the sampler embeds CPU scalars as constants at trace time.
+        device = torch.device("cpu") if comfy.model_management.xla_enabled() else self.device
         if denoise is None or denoise > 0.9999:
-            self.sigmas = self.calculate_sigmas(steps).to(self.device)
+            self.sigmas = self.calculate_sigmas(steps).to(device)
         else:
             if denoise <= 0.0:
                 self.sigmas = torch.FloatTensor([])
             else:
                 new_steps = int(steps/denoise)
-                sigmas = self.calculate_sigmas(new_steps).to(self.device)
+                sigmas = self.calculate_sigmas(new_steps).to(device)
                 self.sigmas = sigmas[-(steps + 1):]
 
     def sample(self, noise, positive, negative, cfg, latent_image=None, start_step=None, last_step=None, force_full_denoise=False, denoise_mask=None, sigmas=None, callback=None, disable_pbar=False, seed=None):

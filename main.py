@@ -11,6 +11,7 @@ if args.list_feature_flags:
     raise SystemExit(0)
 
 import os
+import json
 import importlib.util
 import shutil
 import importlib.metadata
@@ -21,6 +22,11 @@ from app.logger import setup_logger
 console_log_level = get_console_log_level(args.verbose)
 file_log_outputs = get_file_log_outputs(args.verbose)
 setup_logger(log_level=console_log_level, file_outputs=file_log_outputs, use_stdout=args.log_stdout)
+
+# TPU mode: the XLA adapter must own the process before comfy_aimdo,
+# model-management, or any torch.cuda probing runs (spec section 7 ordering).
+import comfy.accelerator
+comfy.accelerator.initialize_accelerator()
 
 from app.assets.seeder import asset_seeder
 from app.assets.services import register_output_files
@@ -55,7 +61,8 @@ if __name__ == "__main__" and args.debug_hang:
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
 
-import comfy_aimdo.control
+if not args.tpu:
+    import comfy_aimdo.control
 
 if enables_dynamic_vram():
     simple_vram_headroom = None if args.reserve_vram is None else int(args.reserve_vram * 1024 ** 3)
@@ -97,9 +104,10 @@ if __name__ == "__main__":
         if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
             os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
 
-    import cuda_malloc
-    if "rocm" in cuda_malloc.get_torch_version_noimport():
-        os.environ['OCL_SET_SVM_SIZE'] = '262144'  # set at the request of AMD
+    if not args.tpu:
+        import cuda_malloc
+        if "rocm" in cuda_malloc.get_torch_version_noimport():
+            os.environ['OCL_SET_SVM_SIZE'] = '262144'  # set at the request of AMD
 
 
 def handle_comfyui_manager_unavailable():
@@ -293,6 +301,8 @@ if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supporte
 
 
 def cuda_malloc_warning():
+    if args.tpu:
+        return
     device = comfy.model_management.get_torch_device()
     device_name = comfy.model_management.get_torch_device_name(device)
     cuda_malloc_warning = False
@@ -480,6 +490,94 @@ def cleanup_temp():
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def run_tpu_warmup(prompt_server):
+    """Compile the production profile before serving (spec section 14).
+
+    Phases: loading (artifact verification) -> compiling (canonical workflow
+    execution covering model load + text encode + denoising + VAE + host
+    transfer + PNG) -> ready. A failure leaves the server non-ready and
+    reports the underlying exception; queue submissions are gated on
+    readiness by the server's pre-queue validator.
+    """
+    from comfy import tpu_profile
+
+    readiness = tpu_profile.readiness
+    readiness.cache_dir = args.tpu_cache_dir
+    readiness.transition("loading")
+
+    manifest = tpu_profile.load_manifest()
+    artifacts = manifest.get("artifacts", {})
+    if not artifacts:
+        readiness.fail("deployment/model_manifest.json is missing or lists no artifacts; the TPU deployment cannot verify its models")
+        return
+
+    results = tpu_profile.verify_artifacts(manifest)
+    readiness.artifact_hashes = [{"name": r["name"], "status": r["status"]} for r in results]
+    failures = [r for r in results if r["status"] != "ok"]
+    if failures:
+        readiness.fail("artifact verification failed: {}".format("; ".join(f.get("detail", f["name"]) for f in failures)))
+        return
+
+    adapter = comfy.accelerator.get_accelerator()
+    device_ids = getattr(adapter, "mesh_device_ids", None)
+    axis_names = getattr(adapter, "mesh_axis_names", None)
+    if device_ids is not None and axis_names is not None:
+        readiness.mesh = "devices={} axes={}".format(list(device_ids), list(axis_names))
+
+    if not args.tpu_warmup:
+        readiness.transition("ready")
+        return
+
+    readiness.transition("compiling")
+    try:
+        workflow_path = os.path.join(tpu_profile.repo_root(), "workflows", "Krea2-turbo-tpu.json")
+        with open(workflow_path) as f:
+            warmup_prompt = json.load(f)
+
+        # execute_outputs must enumerate the workflow's output nodes;
+        # an empty list executes nothing (empty ExecutionList).
+        output_node_ids = [
+            nid for nid, node in warmup_prompt.items()
+            if node.get("class_type") in ("SaveImage", "PreviewImage")
+        ]
+        if not output_node_ids:
+            readiness.fail("warm-up workflow has no SaveImage/PreviewImage output node")
+            return
+
+        counters_before = comfy.accelerator.compile_counters()
+        executor = execution.PromptExecutor(prompt_server)
+        orig_output = folder_paths.get_output_directory()
+        warmup_output = os.path.join(folder_paths.get_temp_directory(), "warmup_output")
+        os.makedirs(warmup_output, exist_ok=True)
+        folder_paths.set_output_directory(warmup_output)
+        try:
+            executor.execute(warmup_prompt, "tpu-warmup", extra_data={}, execute_outputs=output_node_ids)
+        finally:
+            folder_paths.set_output_directory(orig_output)
+        comfy.accelerator.wait_device_ops()
+        shutil.rmtree(warmup_output, ignore_errors=True)
+
+        if not executor.success:
+            messages = " ".join(str(m.get("message", m)) for m in executor.status_messages)
+            readiness.fail("warm-up execution failed: {}".format(messages or "unknown execution error"))
+            return
+
+        counters_after = comfy.accelerator.compile_counters()
+        deltas = {k: counters_after.get(k, 0) - counters_before.get(k, 0) for k in set(counters_after) | set(counters_before)}
+        readiness.fields["compile_counters_delta"] = deltas
+        logging.info("TPU warm-up XLA counters delta: %r", deltas)
+
+        if hasattr(adapter, "write_sharding_report"):
+            readiness.fields["sharding_report"] = adapter.write_sharding_report()
+        if hasattr(adapter, "write_cache_profile"):
+            readiness.fields["cache_profile"] = adapter.write_cache_profile()
+
+        readiness.transition("ready")
+    except Exception as e:
+        readiness.fail("warm-up failed: {}".format(e))
+        logging.exception("TPU warm-up failed; server stays non-ready")
+
+
 def setup_database():
     try:
         if dependencies_available():
@@ -541,6 +639,9 @@ def start_comfyui(asyncio_loop=None):
 
     cuda_malloc_warning()
     setup_database()
+
+    if args.tpu:
+        run_tpu_warmup(prompt_server)
 
     prompt_server.add_routes()
     hijack_progress(prompt_server)

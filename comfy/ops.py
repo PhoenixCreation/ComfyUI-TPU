@@ -28,8 +28,11 @@ import comfy.memory_management
 import comfy.pinned_memory
 import comfy.utils
 
-import comfy_aimdo.model_vbar
-import comfy_aimdo.torch
+try:
+    import comfy_aimdo.model_vbar
+    import comfy_aimdo.torch
+except ImportError:
+    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
 
 def run_every_op():
     if torch.compiler.is_compiling():

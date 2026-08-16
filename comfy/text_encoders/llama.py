@@ -5,7 +5,10 @@ from typing import Optional, Any, Tuple
 import math
 from tqdm import tqdm
 import comfy.utils
-import comfy_kitchen
+try:
+    import comfy_kitchen
+except ImportError:
+    comfy_kitchen = None  # optional accelerator package; fixed-KV paths need it at runtime only
 
 from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
@@ -791,7 +794,7 @@ class Llama2_(nn.Module):
 
     def init_kv_cache(self, batch, capacity, device, dtype):
         caches = []
-        fixed_kv = self.fixed_kv and comfy_kitchen.flash_attention_decode_is_available(device)
+        fixed_kv = self.fixed_kv and comfy_kitchen is not None and comfy_kitchen.flash_attention_decode_is_available(device)
         for _ in range(self.config.num_hidden_layers):
             if fixed_kv:
                 key = torch.empty((batch, capacity, self.config.num_key_value_heads, self.config.head_dim), device=device, dtype=dtype)

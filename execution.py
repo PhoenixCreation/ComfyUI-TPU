@@ -18,7 +18,11 @@ import comfy.memory_management
 import comfy.model_management
 import comfy.model_patcher
 import comfy.model_prefetch
-import comfy_aimdo.model_vbar
+import comfy.tpu_sharding
+try:
+    import comfy_aimdo.model_vbar
+except ImportError:
+    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
 from comfy.internal_logging import detail
 
 from latent_preview import set_preview_method
@@ -728,6 +732,17 @@ class PromptExecutor:
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+        tpu_tracked = comfy.model_management.xla_enabled()
+        if tpu_tracked:
+            from comfy.accelerator import StageTracker, set_current_tracker
+            from comfy import tpu_profile
+            tracker = StageTracker(prompt_id, tpu_profile.PROFILE_NAME)
+            tracker.begin_interval()
+            tracker.record("create_time", extra_data.get("create_time"))
+            tracker.record("compile_counters_before", comfy.accelerator.compile_counters())
+            tracker.record("mesh", getattr(comfy.accelerator.get_accelerator(), "kind", ""))
+            set_current_tracker(tracker)
+
         set_preview_method(extra_data.get("preview_method"))
 
         nodes.interrupt_processing(False)
@@ -841,6 +856,27 @@ class PromptExecutor:
             comfy.memory_management.set_ram_cache_release_state(None, 0)
             self.prompt_model_tracker.end()
             self._notify_prompt_lifecycle("end", prompt_id)
+            if tpu_tracked:
+                # Recovery boundary (spec section 14): drain outstanding work
+                # after cancellation or a recoverable failure so the next
+                # request starts from a clean device state.
+                comfy.accelerator.wait_device_ops()
+                from comfy.accelerator import set_current_tracker
+                set_current_tracker(None)
+                events = [name for name, _ in self.status_messages]
+                outcome = "success"
+                if "execution_interrupted" in events:
+                    outcome = "cancelled"
+                elif not self.success:
+                    outcome = "error"
+                tracker.record("compile_counters_after", comfy.accelerator.compile_counters())
+                tracker.record("memory", comfy.accelerator.memory_info())
+                tracker.record("policy_version", comfy.tpu_sharding.POLICY_VERSION)
+                tracker.record("world_size", comfy.accelerator.get_accelerator().world_size)
+                create_time = tracker.fields.get("create_time")
+                if create_time:
+                    tracker.fields["queue_wait_s"] = round(max(0.0, time.time() - create_time / 1000.0), 3)
+                tracker.emit(outcome)
 
 
 async def validate_inputs(prompt_id, prompt, item, validated, visiting=None):

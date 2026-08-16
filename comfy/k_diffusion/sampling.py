@@ -4,7 +4,12 @@ from functools import partial
 from scipy import integrate
 import torch
 from torch import nn
-import torchsde
+try:
+    import torchsde
+except ImportError:
+    # Only the SDE variants of the dpmpp 2m/3m solvers need torchsde; the
+    # Krea2 profile (er_sde) does not, so a minimal TPU deploy skips it.
+    torchsde = None
 from tqdm.auto import tqdm
 
 from . import utils
