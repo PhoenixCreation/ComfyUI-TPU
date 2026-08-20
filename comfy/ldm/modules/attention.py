@@ -13,9 +13,10 @@ import functools
 try:
     import comfy_kitchen
 except ImportError:
-    # comfy_kitchen is an optional accelerator package (Kaggle images ship it;
-    # minimal TPU deployments do not). All dispatch sites gate on the
-    # availability flag or on --use-ck-attention, which TPU mode rejects.
+    # comfy_kitchen is an optional accelerator package (some distribution
+    # images ship it; minimal TPU deployments do not). All dispatch sites
+    # gate on the availability flag or on --use-ck-attention, which TPU mode
+    # rejects.
     comfy_kitchen = None
 
 from .diffusionmodules.util import AlphaBlender, timestep_embedding

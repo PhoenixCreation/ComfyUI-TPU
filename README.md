@@ -47,7 +47,7 @@ Run from the repo root (`ComfyUI-TPU/`):
 python -m pip install -r deployment/requirements-tpu.txt
 
 # 2. Stage the three 33 GiB BF16 artifacts as symlinks.
-export KREA2_MODEL_ROOT=/kaggle/input/models/helltester2/krea2-bf16/transformers/default/1/models
+export KREA2_MODEL_ROOT=/path/to/krea2-bf16/models
 deployment/stage_models.sh
 
 # 3. (Only after changing artifacts) re-pin SHA-256 into the manifest:
@@ -55,7 +55,7 @@ deployment/stage_models.sh
 
 # 4. Fix PJRT/topology BEFORE the first torch_xla import, pick a writable cache dir, launch.
 source deployment/tpu_env.sh
-export TPU_CACHE_DIR=/kaggle/working/tpu/.tpu-cache-krea2
+export TPU_CACHE_DIR=/tmp/tpu-cache-krea2
 deployment/launch.sh
 ```
 

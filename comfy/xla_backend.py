@@ -8,7 +8,7 @@ Environment is fixed before the import: PJRT TPU is selected via
 ``PJRT_DEVICE``, the metadata-server lookup is skipped (``TPU_SKIP_MDS_QUERY``,
 see docs/changes.md problem 1), and the legacy multi-host variables
 ``TPU_PROCESS_ADDRESSES`` / ``XRT_TPU_CONFIG`` are removed (they push the
-runtime onto a multi-host bootstrap path inside the Kaggle container).
+runtime onto a multi-host bootstrap path inside the container).
 """
 
 import hashlib

@@ -20,7 +20,7 @@ python -m pip install -r deployment/requirements-tpu.txt
 
 # 2. Stage the three large artifacts as symlinks. Override KREA2_MODEL_ROOT
 #    when the model dataset is mounted elsewhere.
-export KREA2_MODEL_ROOT=/kaggle/input/models/helltester2/krea2-bf16/transformers/default/1/models
+export KREA2_MODEL_ROOT=/path/to/krea2-bf16/models
 deployment/stage_models.sh
 
 # 3. The checked-in manifest already contains the verified SHA-256 values.
@@ -30,7 +30,7 @@ deployment/stage_models.sh
 # 4. Set PJRT/topology before the first torch_xla import and choose a writable
 #    cache directory. The launch performs a full generation warm-up.
 source deployment/tpu_env.sh
-export TPU_CACHE_DIR=/kaggle/working/tpu/.tpu-cache-krea2
+export TPU_CACHE_DIR=/tmp/tpu-cache-krea2
 deployment/launch.sh
 ```
 
