@@ -114,6 +114,13 @@ parser.add_argument("--force-channels-last", action="store_true", help="Force ch
 
 parser.add_argument("--directml", type=int, nargs="?", metavar="DIRECTML_DEVICE", const=-1, help="Use torch-directml.")
 
+parser.add_argument("--tpu", action="store_true", help="Run on Google Cloud TPU through PyTorch/XLA SPMD. Mutually exclusive with GPU/CPU device selection and precision/attention flags that require unsupported kernels. Requires --tpu-cache-dir.")
+parser.add_argument("--tpu-cache-dir", type=str, default=None, metavar="PATH", help="Writable persistent XLA compilation-cache directory. Required with --tpu.")
+parser.add_argument("--tpu-profile", type=str, default="krea2-1920x1080", choices=["krea2-1920x1080"], help="TPU execution profile. Only the Phase 1 Krea2 profile is supported.")
+tpu_warmup_group = parser.add_mutually_exclusive_group()
+tpu_warmup_group.add_argument("--tpu-warmup", dest="tpu_warmup", action="store_true", default=True, help="Compile the production profile at startup before serving (default).")
+tpu_warmup_group.add_argument("--no-tpu-warmup", dest="tpu_warmup", action="store_false", help="Skip startup compilation; first request pays the cold compile.")
+
 parser.add_argument("--oneapi-device-selector", type=str, default=None, metavar="SELECTOR_STRING", help="Sets the oneAPI device(s) this instance will use.")
 parser.add_argument("--supports-fp8-compute", action="store_true", help="ComfyUI will act like if the device supports fp8 compute.")
 parser.add_argument("--enable-triton-backend", action="store_true", help="ComfyUI will enable the use of Triton backend in comfy-kitchen. Is disabled at launch by default.")
@@ -294,6 +301,48 @@ if args.disable_auto_launch:
 if args.force_fp16:
     args.fp16_unet = True
 
+if args.tpu:
+    if args.tpu_cache_dir is None:
+        parser.error("--tpu-cache-dir is required when --tpu is enabled")
+
+    tpu_conflicts = {
+        "--cpu": args.cpu,
+        "--directml": args.directml is not None,
+        "--cuda-device": args.cuda_device is not None,
+        "--default-device": args.default_device is not None,
+        "--oneapi-device-selector": args.oneapi_device_selector is not None,
+        "--lowvram": args.lowvram,
+        "--novram": args.novram,
+        "--gpu-only": args.gpu_only,
+        "--highvram": args.highvram,
+    }
+    for flag, enabled in tpu_conflicts.items():
+        if enabled:
+            parser.error("--tpu cannot be combined with {}: TPU mode owns device placement process-wide".format(flag))
+
+    tpu_rejected = {
+        "--force-fp32/--force-fp16": args.force_fp32 or args.force_fp16,
+        "--fp32-unet/--fp64-unet/--fp16-unet/--fp8-*-unet": args.fp32_unet or args.fp64_unet or args.fp16_unet or args.fp8_e4m3fn_unet or args.fp8_e5m2_unet or args.fp8_e8m0fnu_unet,
+        "--fp16-vae/--fp32-vae/--cpu-vae": args.fp16_vae or args.fp32_vae or args.cpu_vae,
+        "--fp8-*-text-enc/--fp16-text-enc/--fp32-text-enc": args.fp8_e4m3fn_text_enc or args.fp8_e5m2_text_enc or args.fp16_text_enc or args.fp32_text_enc,
+        "--cuda-malloc/--disable-cuda-malloc": args.cuda_malloc or args.disable_cuda_malloc,
+        "--enable-triton-backend/--disable-triton-backend": args.enable_triton_backend or args.disable_triton_backend,
+        "--disable-xformers/--use-*-attention": args.disable_xformers or args.use_split_cross_attention or args.use_quad_cross_attention or args.use_sage_attention or args.use_flash_attention or args.use_ck_attention,
+        "--supports-fp8-compute": args.supports_fp8_compute,
+        "--reserve-vram/--vram-headroom/--disable-nvml-pressure": args.reserve_vram is not None or args.vram_headroom != 0 or args.disable_nvml_pressure,
+        "--async-offload/--disable-async-offload": args.async_offload is not None or args.disable_async_offload,
+        "--enable-dynamic-vram/--disable-dynamic-vram": args.enable_dynamic_vram or args.disable_dynamic_vram,
+        "--fast-disk": args.fast_disk,
+    }
+    rejected = [flag for flag, enabled in tpu_rejected.items() if enabled]
+    if args.fast is not None:
+        rejected.append("--fast")
+    if rejected:
+        parser.error("--tpu does not support these flags (rejected with argument error): {}".format(", ".join(rejected)))
+
+    if args.fp16_intermediates:
+        parser.error("--tpu does not support --fp16-intermediates: the Krea2 profile fixes all compute to BF16")
+
 # '--enable-manager-legacy-ui' is meaningless unless the manager is enabled, so imply '--enable-manager'.
 if args.enable_manager_legacy_ui:
     args.enable_manager = True
@@ -310,6 +359,8 @@ else:
     args.fast = set(args.fast)
 
 def enables_dynamic_vram():
+    if args.tpu:
+        return False
     if args.enable_dynamic_vram:
         return True
     return not args.disable_dynamic_vram and not args.highvram and not args.gpu_only and not args.novram and not args.cpu

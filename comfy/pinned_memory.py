@@ -3,8 +3,11 @@ import bisect
 import comfy.model_management
 import comfy.memory_management
 import comfy.utils
-import comfy_aimdo.host_buffer
-import comfy_aimdo.torch
+try:
+    import comfy_aimdo.host_buffer
+    import comfy_aimdo.torch
+except ImportError:
+    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
 import torch
 
 from comfy.cli_args import args
