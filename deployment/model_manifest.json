@@ -1,0 +1,33 @@
+{
+  "profile": "krea2-1920x1080",
+  "comment": "Pinned Krea2 artifacts (implementation spec section 3). Paths are relative to the repo root. sha256 is pinned by deployment/hash_artifacts.py after artifacts are placed (empty string = not yet pinned; warm-up refuses to start until every digest is pinned). source.repository/revision are operator metadata recorded at setup; leave empty when the artifact provenance is not declared.",
+  "artifacts": {
+    "krea2_turbo_bf16.safetensors": {
+      "path": "models/diffusion_models/krea2_turbo_bf16.safetensors",
+      "dtype": "bf16",
+      "source": {
+        "repository": "",
+        "revision": ""
+      },
+      "sha256": "78bbf8f4165eda19cea3cb06c78089221932a39e2eed8af9da741f942c47ffb3"
+    },
+    "qwen3vl_4b_bf16.safetensors": {
+      "path": "models/text_encoders/qwen3vl_4b_bf16.safetensors",
+      "dtype": "bf16",
+      "source": {
+        "repository": "",
+        "revision": ""
+      },
+      "sha256": "36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34"
+    },
+    "qwen_image_vae.safetensors": {
+      "path": "models/vae/qwen_image_vae.safetensors",
+      "dtype": "bf16",
+      "source": {
+        "repository": "",
+        "revision": ""
+      },
+      "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+    }
+  }
+}

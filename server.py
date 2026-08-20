@@ -744,6 +744,15 @@ class PromptServer():
                 features.update(overrides)
             return web.json_response(features)
 
+        @routes.get("/tpu/status")
+        async def get_tpu_status(request):
+            """TPU readiness + warm-up state (spec section 14)."""
+            from comfy import tpu_profile
+            snapshot = tpu_profile.readiness.snapshot()
+            if comfy.model_management.xla_enabled():
+                snapshot["metrics"] = comfy.accelerator.get_accelerator().compile_counters()
+            return web.json_response(snapshot, status=503 if snapshot["state"] != "ready" else 200)
+
         @routes.get("/prompt")
         async def get_prompt(request):
             return web.json_response(self.get_queue_info())
@@ -1122,6 +1131,21 @@ class PromptServer():
                     if usage_source:
                         extra_data["comfy_usage_source"] = usage_source
                 if valid[0]:
+                    if comfy.model_management.xla_enabled():
+                        from comfy import tpu_profile
+                        readiness = tpu_profile.readiness
+                        if readiness.state != "ready":
+                            snapshot = readiness.snapshot()
+                            error = {
+                                "type": "tpu_not_ready",
+                                "message": "TPU server is not ready: warm-up state is '{}'. Requests are rejected until the readiness gate opens.".format(readiness.state),
+                                "details": readiness.last_error or "warm-up in progress or not started",
+                                "extra_info": {"state": readiness.state, "profile": readiness.profile},
+                            }
+                            return web.json_response({"error": error, "node_errors": {}}, status=503)
+                        ok, tpu_error = tpu_profile.validate_prompt(prompt, valid[2])
+                        if not ok:
+                            return web.json_response({"error": tpu_error["error"], "node_errors": tpu_error["node_errors"]}, status=400)
                     outputs_to_execute = valid[2]
                     sensitive = {}
                     for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:

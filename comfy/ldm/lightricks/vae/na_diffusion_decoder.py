@@ -27,7 +27,10 @@ import comfy.model_management
 from comfy.ldm.lightricks.model import get_timestep_embedding
 from .causal_video_autoencoder import Encoder, processor
 
-import comfy_kitchen
+try:
+    import comfy_kitchen
+except ImportError:
+    comfy_kitchen = None  # optional accelerator package; NATTEN path needs it at runtime only
 
 # Token chunk for the SwiGLU MLP (bounds the [chunk, hidden] workspace).
 MLP_TOKEN_CHUNK = 65536
