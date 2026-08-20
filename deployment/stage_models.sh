@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL_ROOT="${KREA2_MODEL_ROOT:-/kaggle/input/models/helltester2/krea2-bf16/transformers/default/1/models}"
+MODEL_ROOT="${KREA2_MODEL_ROOT:-/path/to/krea2-bf16/models}"
 
 declare -A ARTIFACT_DIRS=(
   [krea2_turbo_bf16.safetensors]=diffusion_models
