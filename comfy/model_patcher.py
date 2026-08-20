@@ -36,21 +36,13 @@ import comfy.model_management
 import comfy.ops
 import comfy.patcher_extension
 import comfy.utils
-import comfy.accelerator
-import comfy.tpu_sharding
-try:
-    import comfy_aimdo.host_buffer
-except ImportError:
-    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
+import comfy_aimdo.host_buffer
 from comfy.comfy_types import UnetWrapperFunction
 from comfy.internal_logging import detail
 from comfy.quant_ops import QuantizedTensor
 from comfy.patcher_extension import CallbacksMP, PatcherInjection, WrappersMP
 
-try:
-    import comfy_aimdo.model_vbar
-except ImportError:
-    comfy_aimdo = None
+import comfy_aimdo.model_vbar
 
 def is_model_patcher_output(output):
     return isinstance(output, ModelPatcher) or isinstance(getattr(output, "patcher", None), ModelPatcher)
@@ -743,8 +735,6 @@ class ModelPatcher:
 
 
     def add_object_patch(self, name, obj):
-        if comfy.model_management.xla_enabled() and name != "manual_cast_dtype":
-            raise RuntimeError("TPU mode rejects object patches: model mutations are outside the Krea2 profile")
         self.object_patches[name] = obj
 
     def set_model_compute_dtype(self, dtype):
@@ -754,8 +744,6 @@ class ModelPatcher:
         self.patches_uuid = uuid.uuid4() #TODO: optimize by preventing a full model reload for this
 
     def add_weight_wrapper(self, name, function):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode rejects weight wrapper patches: model mutations are outside the Krea2 profile")
         self.weight_wrapper_patches[name] = self.weight_wrapper_patches.get(name, []) + [function]
         self.patches_uuid = uuid.uuid4()
 
@@ -852,8 +840,6 @@ class ModelPatcher:
             return self.model.get_dtype()
 
     def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode rejects weight patches (LoRA/DisTorch/attention-multiply): model mutations are outside the Krea2 profile")
         with self.use_ejected():
             p = set()
             model_sd = self.model.state_dict()
@@ -994,9 +980,6 @@ class ModelPatcher:
         return loading
 
     def load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=False, full_load=False):
-        if comfy.model_management.xla_enabled():
-            return self._load_tpu(device_to if device_to is not None else self.load_device,
-                                  force_patch_weights=force_patch_weights)
         with self.use_ejected():
             self.unpatch_hooks()
             mem_counter = 0
@@ -1127,80 +1110,6 @@ class ModelPatcher:
 
             self.apply_hooks(self.forced_hooks, force_apply=True)
 
-    def _load_tpu(self, device_to, force_patch_weights=False):
-        """TPU: full-resident chunked parameter materialization.
-
-        The model was constructed and weight-loaded on CPU (host RAM staging);
-        this transfers every parameter to the XLA device with its final
-        sharding annotation in one shot. Partial loads, per-layer offload,
-        patches, and hooks never apply to TPU model objects and are rejected
-        here with actionable errors.
-        """
-        if self.model.device == device_to and self.model.model_loaded_weight_memory >= self.model_size() - 1:
-            return self.model
-
-        mutation_report = []
-        if self.patches:
-            mutation_report.append("weight patches (LoRA/weight patch nodes)")
-        unsupported_object_patches = set(self.object_patches) - {"manual_cast_dtype", "model_sampling"}
-        if unsupported_object_patches:
-            mutation_report.append("object patches")
-        if self.weight_wrapper_patches:
-            mutation_report.append("weight wrapper patches")
-        if self.hook_patches or self.forced_hooks or self.current_hooks:
-            mutation_report.append("hooks (e.g. DisTorch/attention hook nodes)")
-        if (self.wrappers and any(self.wrappers[k] for k in self.wrappers)) or self.injections:
-            mutation_report.append("patcher wrappers/injections")
-        if mutation_report:
-            raise RuntimeError(
-                "TPU mode does not support model mutations for the Krea2 profile: {}. "
-                "Load the model without LoRA/patcher/hook nodes; TPU placement is process-wide.".format(
-                    ", ".join(mutation_report)))
-
-        # TPU mode intentionally keeps the Qwen text encoder on its selected
-        # CPU device. Loading it onto XLA alongside the denoiser raises the
-        # 1920x1080 denoising program above the v5e-8 per-chip HBM limit.
-        # The weights were already populated on the host by the standard
-        # safetensors loader, so no device transfer is needed here.
-        if torch.device(device_to).type != "xla":
-            self.model.device = device_to
-            self.model.model_loaded_weight_memory = self.model_size()
-            self.model.model_offload_buffer_memory = 0
-            self.model.model_lowvram = False
-            self.model.lowvram_patch_counter = 0
-            self.model.current_weight_patches_uuid = None
-            logging.info(
-                "TPU host model retained: %s -> %s (kept off HBM)",
-                self.model.__class__.__name__, device_to)
-            return self.model
-
-        artifact = getattr(self, "tpu_artifact", None)
-        parent = self.parent
-        while artifact is None and parent is not None:
-            artifact = getattr(parent, "tpu_artifact", None)
-            parent = parent.parent
-        if artifact is None:
-            raise RuntimeError("TPU mode requires the loader to tag the patcher with the artifact name (tpu_artifact)")
-
-        policy = comfy.tpu_sharding.policy_for_artifact(artifact)
-        adapter = comfy.accelerator.get_accelerator()
-        if not adapter.is_xla():
-            raise RuntimeError("TPU mode requires the XLA accelerator to be initialized before model load")
-
-        adapter.wait_device_ops()
-        counts = adapter.transfer_sharded(self.model, self.model, policy)
-        comfy.accelerator.mark_step()
-        self.model.device = device_to
-        self.model.model_loaded_weight_memory = self.model_size()
-        self.model.model_offload_buffer_memory = 0
-        self.model.model_lowvram = False
-        self.model.lowvram_patch_counter = 0
-        self.model.current_weight_patches_uuid = None
-        logging.info(
-            "TPU model loaded: %s -> %s (%d sharded, %d replicated parameters, artifact %s)",
-            self.model.__class__.__name__, device_to, counts["sharded"], counts["replicated"], artifact)
-        return self.model
-
     def patch_model(self, device_to=None, lowvram_model_memory=0, load_weights=True, force_patch_weights=False):
         with self.use_ejected():
             for k in self.object_patches:
@@ -1260,8 +1169,6 @@ class ModelPatcher:
         self.object_patches_backup.clear()
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode does not operate partial loads: TPU models are fully resident; unload only through free_memory")
         with self.use_ejected():
             hooks_unpatched = False
             memory_freed = 0
@@ -1347,8 +1254,6 @@ class ModelPatcher:
             return memory_freed
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode does not operate partial loads: TPU models are fully resident; unload only through free_memory")
         with self.use_ejected(skip_and_inject_on_exit_only=True):
             unpatch_weights = self.model.current_weight_patches_uuid is not None and (self.model.current_weight_patches_uuid != self.patches_uuid or force_patch_weights)
             # TODO: force_patch_weights should not unload + reload full model
@@ -1385,19 +1290,9 @@ class ModelPatcher:
         return 0
 
     def partially_unload_ram(self, ram_to_unload):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode does not operate partial loads: TPU models are fully resident")
         return 0
 
     def detach(self, unpatch_all=True):
-        if comfy.model_management.xla_enabled():
-            # Unload on TPU means draining in-flight work and letting the
-            # references drop; moving resident parameters back to host RAM is
-            # pointless for a full-resident deployment.
-            comfy.accelerator.wait_device_ops()
-            for callback in self.get_all_callbacks(CallbacksMP.ON_DETACH):
-                callback(self, unpatch_all)
-            return self.model
         self.eject_model()
         self.model_patches_to(self.offload_device)
         if unpatch_all:
@@ -1640,8 +1535,6 @@ class ModelPatcher:
         return registered
 
     def add_hook_patches(self, hook: comfy.hooks.WeightHook, patches, strength_patch=1.0, strength_model=1.0):
-        if comfy.model_management.xla_enabled():
-            raise RuntimeError("TPU mode rejects model hooks: model mutations are outside the Krea2 profile")
         with self.use_ejected():
             # NOTE: this mirrors behavior of add_patches func
             current_hook_patches: dict[str,list] = self.hook_patches.get(hook.hook_ref, {})
@@ -1688,8 +1581,6 @@ class ModelPatcher:
         return combined_patches
 
     def apply_hooks(self, hooks: comfy.hooks.HookGroup, transformer_options: dict=None, force_apply=False):
-        if comfy.model_management.xla_enabled() and hooks:
-            raise RuntimeError("TPU mode rejects model hooks: model mutations are outside the Krea2 profile")
         # TODO: return transformer_options dict with any additions from hooks
         if self.current_hooks == hooks and (not force_apply or (not self.is_clip and hooks is None)):
             return comfy.hooks.create_transformer_options_from_hooks(self, hooks, transformer_options)

@@ -1,8 +1,5 @@
 import json
-import os
 import torch
-
-import comfy.accelerator
 from enum import Enum
 import logging
 
@@ -268,11 +265,6 @@ class CLIP:
         te_disable_dynamic = disable_dynamic or getattr(self.cond_stage_model, "disable_offload", False)
         ModelPatcher = comfy.model_patcher.ModelPatcher if te_disable_dynamic else comfy.model_patcher.CoreModelPatcher
         self.patcher = ModelPatcher(self.cond_stage_model, load_device=load_device, offload_device=offload_device)
-        if model_management.xla_enabled():
-            artifact = model_options.get("tpu_artifact")
-            if artifact is None:
-                raise RuntimeError("TPU mode requires the text encoder loader to set model_options['tpu_artifact'] (loader node tagging error)")
-            self.patcher.tpu_artifact = artifact
         #Match torch.float32 hardcode upcast in TE implemention
         self.patcher.set_model_compute_dtype(torch.float32)
         self.patcher.hook_mode = comfy.hooks.EnumHookMode.MinVram
@@ -1058,11 +1050,6 @@ class VAE:
 
         if device is None:
             device = model_management.vae_device()
-        if model_management.xla_enabled():
-            # TPU: the VAE weights are materialized on XLA by the patcher; the
-            # object itself stays host-side, but decode input/output device
-            # must be the accelerator so latents never round-trip to CPU.
-            device = comfy.accelerator.get_accelerator().device
         self.device = device
         offload_device = model_management.vae_offload_device()
         if dtype is None:
@@ -1213,12 +1200,6 @@ class VAE:
         return args
 
     def decode(self, samples_in, vae_options={}):
-        tpu_active = model_management.xla_enabled()
-        tpu_tracker = None
-        if tpu_active:
-            tpu_tracker = comfy.accelerator.get_current_tracker()
-            if tpu_tracker is not None:
-                tpu_tracker.begin("vae")
         self.throw_exception_if_invalid()
         pixel_samples = None
         do_tile = False
@@ -1293,12 +1274,6 @@ class VAE:
                         overlap = tile // 4
                         pixel_samples = self.decode_tiled_3d(samples_in, tile_t=tile_t, tile_x=tile, tile_y=tile, overlap=(1, overlap, overlap))
 
-        if tpu_active:
-            # TPU boundary (spec section 12): drain the VAE section before the
-            # device-to-host transfer materializes pixel data.
-            if tpu_tracker is not None:
-                tpu_tracker.end("vae")
-            comfy.accelerator.mark_step()
         pixel_samples = pixel_samples.to(self.output_device).movedim(1,-1)
         return pixel_samples
 
@@ -2202,8 +2177,6 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         ModelPatcher = comfy.model_patcher.ModelPatcher if disable_dynamic else comfy.model_patcher.CoreModelPatcher
         offload_device = model_options.get("offload_device", model_management.unet_offload_device())
         model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-        if model_management.xla_enabled() and model_options.get("tpu_artifact"):
-            model_patcher.tpu_artifact = model_options["tpu_artifact"]
         model.load_model_weights(sd, diffusion_model_prefix, assign=model_patcher.is_dynamic())
 
     if output_vae:
@@ -2211,8 +2184,6 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
         vae_sd = model_config.process_vae_state_dict(vae_sd)
         vae_device = model_options.get("load_device", None)
         vae = VAE(sd=vae_sd, metadata=metadata, device=vae_device)
-        if model_management.xla_enabled() and model_options.get("tpu_artifact"):
-            vae.patcher.tpu_artifact = model_options["tpu_artifact"]
 
     if output_clip:
         if te_model_options.get("custom_operations", None) is None:
@@ -2348,10 +2319,6 @@ def load_diffusion_model_state_dict(sd, model_options={}, metadata=None, disable
     model_patcher = ModelPatcher(model, load_device=load_device, offload_device=offload_device)
     if not model_management.is_device_cpu(offload_device):
         model.to(offload_device)
-    if model_management.xla_enabled():
-        if not model_options.get("tpu_artifact"):
-            raise RuntimeError("TPU mode requires the diffusion model loader to set model_options['tpu_artifact'] (loader node tagging error)")
-        model_patcher.tpu_artifact = model_options["tpu_artifact"]
     model.load_model_weights(new_sd, "", assign=model_patcher.is_dynamic())
     left_over = sd.keys()
     if len(left_over) > 0:
@@ -2385,8 +2352,6 @@ def load_vae_patcher(vae_path, metadata=None, device=None, disable_dynamic=False
         sd = comfy.utils.load_torch_file(vae_path)
     vae = VAE(sd=sd, metadata=metadata, device=device)
     vae.throw_exception_if_invalid()
-    if model_management.xla_enabled():
-        vae.patcher.tpu_artifact = os.path.basename(vae_path)
     return vae.patcher
 
 def load_unet(unet_path, dtype=None):

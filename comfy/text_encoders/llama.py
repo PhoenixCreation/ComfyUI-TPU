@@ -5,10 +5,7 @@ from typing import Optional, Any, Tuple
 import math
 from tqdm import tqdm
 import comfy.utils
-try:
-    import comfy_kitchen
-except ImportError:
-    comfy_kitchen = None  # optional accelerator package; fixed-KV paths need it at runtime only
+import comfy_kitchen
 
 from comfy.ldm.modules.attention import optimized_attention_for_device
 import comfy.model_management
@@ -678,10 +675,7 @@ class TransformerBlock(nn.Module):
         residual = x
         x = self.post_attention_layernorm(x)
         x = self.mlp(x)
-        if comfy.model_management.xla_enabled():
-            x = residual + x
-        else:
-            x = torch.add(residual, x, out=output)
+        x = torch.add(residual, x, out=output)
 
         return x, present_key_value
 
@@ -746,10 +740,7 @@ class TransformerBlockGemma2(nn.Module):
         x = self.pre_feedforward_layernorm(x)
         x = self.mlp(x)
         x = self.post_feedforward_layernorm(x)
-        if comfy.model_management.xla_enabled():
-            x = residual + x
-        else:
-            x = torch.add(residual, x, out=output)
+        x = torch.add(residual, x, out=output)
 
         return x, present_key_value
 
@@ -800,7 +791,7 @@ class Llama2_(nn.Module):
 
     def init_kv_cache(self, batch, capacity, device, dtype):
         caches = []
-        fixed_kv = self.fixed_kv and comfy_kitchen is not None and comfy_kitchen.flash_attention_decode_is_available(device)
+        fixed_kv = self.fixed_kv and comfy_kitchen.flash_attention_decode_is_available(device)
         for _ in range(self.config.num_hidden_layers):
             if fixed_kv:
                 key = torch.empty((batch, capacity, self.config.num_key_value_heads, self.config.head_dim), device=device, dtype=dtype)

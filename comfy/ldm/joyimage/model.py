@@ -2,10 +2,7 @@
 import math
 from typing import Optional, Tuple
 
-try:
-    import comfy_kitchen
-except ImportError:
-    comfy_kitchen = None  # optional accelerator package; JoyAI needs it at runtime only
+import comfy_kitchen
 import torch
 import torch.nn as nn
 

@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import comfy.model_management
-import comfy.accelerator
 import comfy.patcher_extension
 import comfy.ldm.common_dit
 import comfy.utils
@@ -78,9 +77,9 @@ class Attention(nn.Module):
         transformer_patches = transformer_options.get("patches", {})
         extra_options = transformer_options.copy()
         q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
-        q = q.reshape(*q.shape[:2], self.heads, -1).transpose(1, 2)
-        k = k.reshape(*k.shape[:2], self.kvheads, -1).transpose(1, 2)
-        v = v.reshape(*v.shape[:2], self.kvheads, -1).transpose(1, 2)
+        q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
+        k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
+        v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
         q, k = self.qknorm(q, k)
 
         if "block_index" in transformer_options and "attn1_patch" in transformer_patches:
@@ -158,7 +157,7 @@ class TextFusionTransformer(nn.Module):
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
             x = block(x.contiguous(), mask=None, transformer_options=transformer_options)
-        x = x.reshape(b, l, n, d).transpose(2, 3)
+        x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
         x = self.projector(x).squeeze(-1)
         for block in self.refiner_blocks:
             x = block(x, mask=mask, transformer_options=transformer_options)
@@ -285,7 +284,7 @@ class SingleStreamDiT(nn.Module):
         patch = self.patch
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (patch, patch))
         h, w = x.shape[-2] // patch, x.shape[-1] // patch
-        img = x.reshape(x.shape[0], x.shape[1], h, patch, w, patch).permute(0, 2, 4, 1, 3, 5).reshape(x.shape[0], h * w, -1)
+        img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
 
         img_ids = torch.zeros(h, w, 3, device=x.device, dtype=torch.float32)
         img_ids[..., 0] = index
@@ -369,12 +368,6 @@ class SingleStreamDiT(nn.Module):
         for i, block in enumerate(self.blocks):
             transformer_options["block_index"] = i
             combined = block(combined, tvec, freqs, None, timestep_zero_index=timestep_zero_index, transformer_options=transformer_options)
-            if comfy.model_management.xla_enabled():
-                # A full 1920x1080 Krea2 pass exceeds v5e HBM as one XLA
-                # program. Blocks share the same activation contract, so each
-                # boundary can reuse a small compiled program while releasing
-                # the previous block's attention temporaries.
-                comfy.accelerator.mark_step()
 
         final = self.last(combined, t)
         del combined

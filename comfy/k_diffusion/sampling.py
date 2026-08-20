@@ -4,12 +4,7 @@ from functools import partial
 from scipy import integrate
 import torch
 from torch import nn
-try:
-    import torchsde
-except ImportError:
-    # Only the SDE variants of the dpmpp 2m/3m solvers need torchsde; the
-    # Krea2 profile (er_sde) does not, so a minimal TPU deploy skips it.
-    torchsde = None
+import torchsde
 from tqdm.auto import tqdm
 
 from . import utils
@@ -17,7 +12,6 @@ from . import deis
 from . import sa_solver
 import comfy.model_patcher
 import comfy.model_sampling
-import comfy.accelerator
 
 import comfy.memory_management
 from comfy.utils import model_trange as trange
@@ -82,24 +76,16 @@ def get_ancestral_step(sigma_from, sigma_to, eta=1.):
 
 
 def default_noise_sampler(x, seed=None):
-    xla_device = x.device.type == "xla"
     if seed is not None:
         if x.device == torch.device("cpu"):
             seed += 1
 
-        # torch.Generator cannot target XLA's virtual SPMD device. Generate
-        # deterministic sampler noise on the host and transfer it explicitly.
-        generator = torch.Generator(device="cpu" if xla_device else x.device)
+        generator = torch.Generator(device=x.device)
         generator.manual_seed(seed)
     else:
         generator = None
 
-    def sample_noise(sigma, sigma_next):
-        device = "cpu" if xla_device else x.device
-        noise = torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=device, generator=generator)
-        return noise.to(x.device) if xla_device else noise
-
-    return sample_noise
+    return lambda sigma, sigma_next: torch.randn(x.size(), dtype=x.dtype, layout=x.layout, device=x.device, generator=generator)
 
 
 class BatchedBrownianTree:
@@ -1599,11 +1585,6 @@ def sample_er_sde(model, x, sigmas, extra_args=None, callback=None, disable=None
             if s_noise > 0:
                 x = x + alpha_t * noise_sampler(sigmas[i], sigmas[i + 1]) * s_noise * (er_lambda_t ** 2 - er_lambda_s ** 2 * r ** 2).sqrt().nan_to_num(nan=0.0)
         old_denoised = denoised
-        if x.device.type == "xla":
-            # Keep the eight denoising passes as separate lazy graphs. Without
-            # this boundary XLA retains every pass's attention activations and
-            # exhausts v5e HBM before the second step completes.
-            comfy.accelerator.mark_step()
     return x
 
 

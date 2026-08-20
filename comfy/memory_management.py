@@ -4,10 +4,7 @@ import dataclasses
 import torch
 from typing import NamedTuple
 
-try:
-    import comfy_aimdo.host_buffer
-except ImportError:
-    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
+import comfy_aimdo.host_buffer
 from comfy.quant_ops import QuantizedTensor
 
 

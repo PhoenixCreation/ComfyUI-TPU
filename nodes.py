@@ -21,7 +21,6 @@ import numpy as np
 import safetensors.torch
 
 import comfy.diffusers_load
-import comfy.accelerator
 import comfy.samplers
 import comfy.sample
 import comfy.sd
@@ -853,8 +852,6 @@ class VAELoader:
                 metadata["tae_latent_channels"] = 128
         vae = comfy.sd.VAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
-        if comfy.model_management.xla_enabled():
-            vae.patcher.tpu_artifact = vae_name
         # Register a reload factory on the patcher so multigpu deepclones
         # (Select VAE Device, future MultiGPU VAE work-units) can produce
         # per-device clones from the same loader context. Only set when we
@@ -995,8 +992,6 @@ class UNETLoader:
 
     def load_unet(self, unet_name, weight_dtype):
         model_options = {}
-        if comfy.model_management.xla_enabled():
-            model_options["tpu_artifact"] = unet_name
         if weight_dtype == "fp8_e4m3fn":
             model_options["dtype"] = torch.float8_e4m3fn
         elif weight_dtype == "fp8_e4m3fn_fast":
@@ -1029,8 +1024,6 @@ class CLIPLoader:
         clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
 
         model_options = {}
-        if comfy.model_management.xla_enabled():
-            model_options["tpu_artifact"] = clip_name
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
 
@@ -1701,15 +1694,8 @@ class SaveImage:
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, images[0].shape[1], images[0].shape[0])
         results = list()
         for (batch_number, image) in enumerate(images):
-            with comfy.accelerator.stage_timer("host_transfer"):
-                if comfy.accelerator.is_xla():
-                    comfy.accelerator.wait_device_ops()
-                    image_np = image.cpu().numpy()
-                else:
-                    image_np = image.cpu().numpy()
-                i = 255. * image_np
-            with comfy.accelerator.stage_timer("png_encode"):
-                img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            i = 255. * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
             metadata = None
             if not args.disable_metadata:
                 metadata = PngInfo()
@@ -1721,8 +1707,7 @@ class SaveImage:
 
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}_.png"
-            with comfy.accelerator.stage_timer("file_write"):
-                img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
+            img.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=self.compress_level)
             results.append({
                 "filename": file,
                 "subfolder": subfolder,

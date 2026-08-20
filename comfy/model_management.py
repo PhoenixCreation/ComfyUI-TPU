@@ -32,14 +32,8 @@ from contextlib import contextmanager, nullcontext
 import comfy.memory_management
 import comfy.utils
 import comfy.quant_ops
-import comfy.accelerator
-try:
-    import comfy_aimdo.host_buffer
-    import comfy_aimdo.vram_buffer
-except ImportError:
-    # TPU-minimal deployments do not ship AIMDO; every use site is guarded by
-    # comfy.memory_management.aimdo_enabled which is False without the package.
-    comfy_aimdo = None
+import comfy_aimdo.host_buffer
+import comfy_aimdo.vram_buffer
 from comfy.internal_logging import detail
 
 from typing import TYPE_CHECKING
@@ -64,12 +58,6 @@ class CPUState(Enum):
 vram_state = VRAMState.NORMAL_VRAM
 set_vram_to = VRAMState.NORMAL_VRAM
 cpu_state = CPUState.GPU
-
-def xla_enabled() -> bool:
-    """TPU mode: process-wide XLA SPMD placement. The loader is
-    comfy.accelerator's XlaAccelerator; every generic code path consults this
-    flag before touching torch.cuda or per-device placement."""
-    return args.tpu
 
 total_vram = 0
 
@@ -206,11 +194,6 @@ def is_wsl():
 def get_torch_device():
     global directml_enabled
     global cpu_state
-    if xla_enabled():
-        device = comfy.accelerator.get_accelerator().device
-        if device is None:
-            raise RuntimeError("TPU mode requires comfy.accelerator.initialize_accelerator() to run before any model-management call (startup order error)")
-        return device
     if directml_enabled:
         global directml_device
         return directml_device
@@ -231,9 +214,7 @@ def get_torch_device():
 def get_all_torch_devices(exclude_current=False):
     global cpu_state
     devices = []
-    if xla_enabled():
-        devices.append(get_torch_device())
-    elif cpu_state == CPUState.GPU:
+    if cpu_state == CPUState.GPU:
         # NVIDIA + AMD/ROCm both expose their GPUs through torch.cuda.*;
         # without the AMD arm, single-GPU ROCm users get an empty list
         # which silently turns unload_all_models() into a no-op.
@@ -336,10 +317,7 @@ def get_total_memory(dev=None, torch_total_too=False):
     if dev is None:
         dev = get_torch_device()
 
-    if xla_enabled():
-        mem_total = psutil.virtual_memory().total
-        mem_total_torch = mem_total
-    elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
         mem_total = psutil.virtual_memory().total
         mem_total_torch = mem_total
     else:
@@ -409,8 +387,6 @@ def is_oom(e):
         return True
     if isinstance(e, ACCELERATOR_ERROR) and (getattr(e, 'error_code', None) == 2 or "out of memory" in str(e).lower()):
         discard_cuda_async_error()
-        return True
-    if "resource exhausted" in str(e).lower() or "out of memory" in str(e).lower():
         return True
     return False
 
@@ -494,12 +470,6 @@ try:
             ENABLE_PYTORCH_ATTENTION = True
 except:
     pass
-
-if args.tpu:
-    # TPU mode: only the PyTorch (SDPA math) attention path is available;
-    # xformers/FlashAttention/SageAttention/CK attention are rejected flags.
-    ENABLE_PYTORCH_ATTENTION = True
-    XFORMERS_IS_AVAILABLE = False
 
 
 SUPPORT_FP8_OPS = args.supports_fp8_compute
@@ -616,8 +586,6 @@ if DISABLE_SMART_MEMORY:
     logging.info("Disabling smart memory management")
 
 def get_torch_device_name(device):
-    if xla_enabled():
-        return "Google TPU v5e-8 (XLA SPMD, 8-device model mesh)"
     if hasattr(device, 'type'):
         if device.type == "cuda":
             try:
@@ -744,8 +712,6 @@ def should_free_pins_for_ram_pressure(shortfall):
         return True
 
 def ensure_pin_budget(size, evict_active=False, loaded=False):
-    if xla_enabled():
-        return True
     if args.high_ram:
         return True
     if args.fast_disk:
@@ -814,17 +780,6 @@ class LoadedModel:
             return self.model_memory()
 
     def model_load(self, lowvram_model_memory=0, force_patch_weights=False):
-        if xla_enabled():
-            # TPU: full-resident chunked materialization; partial loads and
-            # per-layer offload never apply (ModelPatcher.load raises for them).
-            self.model.load(device_to=self.device, lowvram_model_memory=0,
-                            force_patch_weights=force_patch_weights, full_load=True)
-            real_model = self.model.model
-            self.real_model = weakref.ref(real_model)
-            self.model_finalizer = weakref.finalize(real_model, cleanup_models)
-            self.model_finalizer.atexit = False
-            return real_model
-
         self.model.model_patches_to(self.device)
         self.model.model_patches_to(self.model.model_dtype())
 
@@ -848,13 +803,11 @@ class LoadedModel:
         return False
 
     def model_unload(self, memory_to_free=None, unpatch_weights=True):
-        if memory_to_free is not None and not xla_enabled():
+        if memory_to_free is not None:
             if memory_to_free < self.model.loaded_size():
                 freed = self.model.partially_unload(self.model.offload_device, memory_to_free)
                 if freed >= memory_to_free:
                     return False
-        if xla_enabled():
-            comfy.accelerator.wait_device_ops()
         self.model.detach(unpatch_weights)
         self.model_finalizer.detach()
         self.model_finalizer = None
@@ -1121,8 +1074,6 @@ def dtype_size(dtype):
     return dtype_size
 
 def unet_offload_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if vram_state == VRAMState.HIGH_VRAM:
         return get_torch_device()
     else:
@@ -1130,8 +1081,6 @@ def unet_offload_device():
 
 def unet_inital_load_device(parameters, dtype):
     cpu_dev = torch.device("cpu")
-    if xla_enabled():
-        return cpu_dev
     if comfy.memory_management.aimdo_enabled:
         return cpu_dev
 
@@ -1155,8 +1104,6 @@ def maximum_vram_for_weights(device=None):
     return (get_total_memory(device) * 0.88 - minimum_inference_memory())
 
 def unet_dtype(device=None, model_params=0, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32], weight_dtype=None):
-    if xla_enabled():
-        return torch.bfloat16
     if model_params < 0:
         model_params = 1000000000000000000000
     if args.fp32_unet:
@@ -1234,16 +1181,12 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if args.gpu_only:
         return get_torch_device()
     else:
         return torch.device("cpu")
 
 def text_encoder_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if args.gpu_only:
         return get_torch_device()
     elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM) or comfy.memory_management.aimdo_enabled:
@@ -1272,8 +1215,6 @@ def text_encoder_initial_device(load_device, offload_device, model_size=0):
         return offload_device
 
 def text_encoder_dtype(device=None):
-    if xla_enabled():
-        return torch.bfloat16
     if args.fp8_e4m3fn_text_enc:
         return torch.float8_e4m3fn
     elif args.fp8_e5m2_text_enc:
@@ -1292,8 +1233,6 @@ def text_encoder_dtype(device=None):
 
 
 def intermediate_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -1306,23 +1245,17 @@ def intermediate_dtype():
         return torch.float32
 
 def vae_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if args.cpu_vae:
         return torch.device("cpu")
     return get_torch_device()
 
 def vae_offload_device():
-    if xla_enabled():
-        return torch.device("cpu")
     if args.gpu_only:
         return get_torch_device()
     else:
         return torch.device("cpu")
 
 def vae_dtype(device=None, allowed_dtypes=[]):
-    if xla_enabled():
-        return torch.bfloat16
     if args.fp16_vae:
         return torch.float16
     elif args.bf16_vae:
@@ -1673,8 +1606,6 @@ def discard_cuda_async_error():
 
 def pin_memory(tensor):
     global TOTAL_PINNED_MEMORY
-    if xla_enabled():
-        return False
     if MAX_PINNED_MEMORY <= 0:
         return False
 
@@ -1753,8 +1684,6 @@ def flash_attention_enabled():
 def xformers_enabled():
     global directml_enabled
     global cpu_state
-    if xla_enabled():
-        return False
     if cpu_state != CPUState.GPU:
         return False
     if is_intel_xpu():
@@ -1821,12 +1750,7 @@ def get_free_memory(dev=None, torch_free_too=False):
     if dev is None:
         dev = get_torch_device()
 
-    if xla_enabled():
-        # XLA device memory is not a host-queryable pool; TPU mode keeps
-        # models resident and stages on host RAM, so report host availability.
-        mem_free_total = psutil.virtual_memory().available
-        mem_free_torch = mem_free_total
-    elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
         mem_free_total = psutil.virtual_memory().available
         mem_free_torch = mem_free_total
     else:
@@ -1908,8 +1832,6 @@ def is_directml_enabled():
     return False
 
 def should_use_fp16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
-    if xla_enabled():
-        return False
     if device is not None:
         if is_device_cpu(device):
             return False
@@ -1977,8 +1899,6 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
     return True
 
 def should_use_bf16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
-    if xla_enabled():
-        return True
     if device is not None:
         if is_device_cpu(device): #TODO ? bf16 works on CPU but is extremely slow
             return False
@@ -2124,9 +2044,6 @@ def synchronize():
 
 def soft_empty_cache(force=False):
     if cpu_mode():
-        return
-    if xla_enabled():
-        comfy.accelerator.wait_device_ops()
         return
     global cpu_state
     if cpu_state == CPUState.MPS:

@@ -2,10 +2,7 @@ import torch
 import warnings
 import weakref
 
-try:
-    import comfy_aimdo.model_vbar
-except ImportError:
-    comfy_aimdo = None  # TPU-minimal deployments; guard via aimdo_enabled
+import comfy_aimdo.model_vbar
 from comfy.cli_args import args
 import comfy.memory_management
 import comfy.model_management
