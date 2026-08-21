@@ -102,6 +102,13 @@ class XlaAccelerator:
         constants, dtype, mesh, and the sharding policy version, so changing
         any one of them cannot silently reuse an incompatible executable.
         """
+        # Dynamic Krea2 sizes share one persistent-cache directory; the cache
+        # key includes program shape, so per-size executables are distinct
+        # inside the directory. Keep the fixed profile's hash stable.
+        if args.tpu_profile == getattr(tpu_profile, "PROFILE_NAME_DYNAMIC", None):
+            latent_str = "dynamic"
+        else:
+            latent_str = str(list(tpu_profile.LATENT_SHAPE))
         parts = [
             "torch=" + torch.__version__,
             "profile=" + args.tpu_profile,
@@ -113,7 +120,7 @@ class XlaAccelerator:
                 tpu_profile.TOKENIZER_PREFIX_TOKENS,
                 tpu_profile.TOKENIZER_CLOSING_TOKENS,
             ),
-            "latent=%s" % (list(tpu_profile.LATENT_SHAPE),),
+            "latent=%s" % latent_str,
         ]
         manifest = tpu_profile.load_manifest()
         for name, info in sorted(manifest.get("artifacts", {}).items()):

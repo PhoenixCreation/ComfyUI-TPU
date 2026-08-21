@@ -90,9 +90,11 @@ def test_wrong_clip_type_rejected(canonical_workflow):
 def test_wrong_profile_fields_rejected(canonical_workflow):
     from comfy import tpu_profile
 
+    # Dynamic sizes: 1280 and 720 are now valid (multiples of 8, area <2.1M).
+    # Use truly invalid sizes for width/height checks.
     cases = [
-        ({"10": ("width", 1280)}, "tpu_profile_wrong_width"),
-        ({"10": ("height", 720)}, "tpu_profile_wrong_height"),
+        ({"10": ("width", 1281)}, "tpu_profile_wrong_width"),  # not multiple of 8
+        ({"10": ("height", 721)}, "tpu_profile_wrong_height"),
         ({"10": ("batch_size", 2)}, "tpu_profile_wrong_batch_size"),
         ({"2": ("steps", 4)}, "tpu_profile_wrong_steps"),
         ({"2": ("cfg", 2.0)}, "tpu_profile_wrong_cfg"),

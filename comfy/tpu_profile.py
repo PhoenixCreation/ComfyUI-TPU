@@ -14,9 +14,14 @@ import time
 from typing import Dict, List, Optional
 
 PROFILE_NAME = "krea2-1920x1080"
+# New dynamic profile alias (same artifacts, relaxed size validation).
+PROFILE_NAME_DYNAMIC = "krea2"
+SUPPORTED_PROFILES = [PROFILE_NAME, PROFILE_NAME_DYNAMIC]
 
 # Fixed production profile (spec section 4). Prompt text and seed may vary;
-# every value that affects tensor shapes is fixed.
+# every value that affects tensor shapes is fixed. Phase 2 keeps the same
+# sampler/cfg/scheduler/denoise but relaxes width/height to any valid Krea2
+# size — first execution of a new size compiles on demand and stays cached.
 PROFILE = {
     "width": 1920,
     "height": 1080,
@@ -28,6 +33,44 @@ PROFILE = {
     "denoise": 1.0,
     "save_prefix": "krea2_automatic",
 }
+
+# Dynamic size contract: any W×H that is a multiple of 8, within 512–2048
+# per side and ~0.5–2.1 Mpx (covers 1024×1024, 1080×1920 and other ~1 Mpx
+# sizes). The bound is intentionally permissive — HBM fit is enforced by the
+# actual XLA compilation; invalid shapes surface as a clear execution error.
+DYNAMIC_MIN_SIDE = 512
+DYNAMIC_MAX_SIDE = 2048
+DYNAMIC_MIN_AREA = DYNAMIC_MIN_SIDE * DYNAMIC_MIN_SIDE  # 262144
+DYNAMIC_MAX_AREA = 2100000  # ~1920×1080 (2073600) with slack
+DYNAMIC_STEP = 8
+
+
+def is_valid_krea2_size(width, height, batch_size=1) -> bool:
+    """Check whether EmptyLatentImage dimensions are allowed on TPU.
+
+    Fixed Phase 1 required exactly 1920×1080×1; Phase 2 allows any multiple
+    of 8 within 512–2048 and area bounds. This is the user-visible size
+    gate — batch must stay 1 and steps/cfg/sampler remain fixed.
+    """
+    if batch_size != PROFILE["batch_size"]:
+        return False
+    if not isinstance(width, int) or not isinstance(height, int):
+        return False
+    if width < DYNAMIC_MIN_SIDE or height < DYNAMIC_MIN_SIDE:
+        return False
+    if width > DYNAMIC_MAX_SIDE or height > DYNAMIC_MAX_SIDE:
+        return False
+    if width % DYNAMIC_STEP != 0 or height % DYNAMIC_STEP != 0:
+        return False
+    area = width * height
+    if area < DYNAMIC_MIN_AREA or area > DYNAMIC_MAX_AREA:
+        return False
+    return True
+
+
+def latent_shape_for(width: int, height: int):
+    """Latent shape for an image size: (1, 16, H//8, W//8)."""
+    return (1, 16, height // 8, width // 8)
 
 # Tokenizer constants derived from the pinned tokenizer
 # (comfy/text_encoders/qwen25_tokenizer, Qwen2Tokenizer, transformers pinned in
@@ -205,8 +248,9 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
         return False, _error("tpu_profile_no_output_nodes", "TPU profile requires at least one output node", None)
 
     loaders = {"UNETLoader": False, "CLIPLoader": False, "VAELoader": False}
+    # KSampler and other shape-affecting fields remain fixed; EmptyLatentImage
+    # is dynamic in Phase 2 — any valid Krea2 size compiles on demand.
     fields = {
-        "EmptyLatentImage": {"width": PROFILE["width"], "height": PROFILE["height"], "batch_size": PROFILE["batch_size"]},
         "KSampler": {"steps": PROFILE["steps"], "cfg": PROFILE["cfg"], "sampler_name": PROFILE["sampler_name"],
                      "scheduler": PROFILE["scheduler"], "denoise": PROFILE["denoise"]},
     }
@@ -259,6 +303,30 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
                                      "VAE '{}' is not in the approved manifest; expected "
                                      "qwen_image_vae.safetensors".format(inputs.get("vae_name")),
                                      nid, observed=inputs.get("vae_name"), required="qwen_image_vae.safetensors")
+        elif class_type == "EmptyLatentImage":
+            w = inputs.get("width")
+            h = inputs.get("height")
+            b = inputs.get("batch_size")
+            if not is_valid_krea2_size(w, h, b):
+                if b != PROFILE["batch_size"]:
+                    field = "batch_size"
+                    observed = b
+                    required = PROFILE["batch_size"]
+                elif not isinstance(w, int) or w < DYNAMIC_MIN_SIDE or w > DYNAMIC_MAX_SIDE or w % DYNAMIC_STEP != 0:
+                    field = "width"
+                    observed = w
+                    required = f"multiple of {DYNAMIC_STEP} in [{DYNAMIC_MIN_SIDE},{DYNAMIC_MAX_SIDE}]"
+                elif not isinstance(h, int) or h < DYNAMIC_MIN_SIDE or h > DYNAMIC_MAX_SIDE or h % DYNAMIC_STEP != 0:
+                    field = "height"
+                    observed = h
+                    required = f"multiple of {DYNAMIC_STEP} in [{DYNAMIC_MIN_SIDE},{DYNAMIC_MAX_SIDE}]"
+                else:
+                    field = "width"
+                    observed = f"{w}x{h}={w*h if isinstance(w, int) and isinstance(h, int) else 'invalid'}"
+                    required = f"area {DYNAMIC_MIN_AREA}-{DYNAMIC_MAX_AREA}"
+                return False, _error(f"tpu_profile_wrong_{field}",
+                                     f"{field} value {observed} does not satisfy Krea2 dynamic size contract (required: {required})",
+                                     nid, observed=observed, required=required)
         elif class_type in fields:
             mismatches = []
             for field, required in fields[class_type].items():

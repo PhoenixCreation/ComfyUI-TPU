@@ -116,7 +116,7 @@ parser.add_argument("--directml", type=int, nargs="?", metavar="DIRECTML_DEVICE"
 
 parser.add_argument("--tpu", action="store_true", help="Run on Google Cloud TPU through PyTorch/XLA SPMD. Mutually exclusive with GPU/CPU device selection and precision/attention flags that require unsupported kernels. Requires --tpu-cache-dir.")
 parser.add_argument("--tpu-cache-dir", type=str, default=None, metavar="PATH", help="Writable persistent XLA compilation-cache directory. Required with --tpu.")
-parser.add_argument("--tpu-profile", type=str, default="krea2-1920x1080", choices=["krea2-1920x1080"], help="TPU execution profile. Only the Phase 1 Krea2 profile is supported.")
+parser.add_argument("--tpu-profile", type=str, default="krea2-1920x1080", choices=["krea2-1920x1080", "krea2"], help="TPU execution profile. 'krea2-1920x1080' is the Phase 1 fixed profile (still accepted); 'krea2' enables dynamic sizes (1024x1024, 1080x1920, other ~1 Mpx, any multiple of 8 in 512–2048 with area ≤2.1 Mpx). Both share BF16/xla mesh.")
 tpu_warmup_group = parser.add_mutually_exclusive_group()
 tpu_warmup_group.add_argument("--tpu-warmup", dest="tpu_warmup", action="store_true", default=True, help="Compile the production profile at startup before serving (default).")
 tpu_warmup_group.add_argument("--no-tpu-warmup", dest="tpu_warmup", action="store_false", help="Skip startup compilation; first request pays the cold compile.")
