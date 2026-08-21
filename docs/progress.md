@@ -9,7 +9,7 @@
 
 ## In Progress
 
-- [ ] Ideogram 4 support
+- [ ] Ideogram 4 support — plan: [`docs/architecture/proposed/002-ideogram4-bf16-support.md`](architecture/proposed/002-ideogram4-bf16-support.md) (BF16 artifacts via offline fp8 dequant; awaiting model staging)
 
 ## Roadmap
 
