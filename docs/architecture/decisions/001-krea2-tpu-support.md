@@ -1,26 +1,18 @@
-# ADR 001 — Krea2 Turbo TPU Support (Phase 1)
+# ADR 001 — Krea2 Turbo TPU Support
 
-*Status: Accepted — shipped on `feature/krea2-tpu` (commits `770ac59c` + `73576271`).*
-*Scope: TPU v5e-8 (`v5litepod-8`, single-host 8 chips) · profile `krea2-1920x1080` only.*
+*Status: Accepted — shipped as one decision: fixed `1920×1080` (`770ac59c` + `73576271`) + dynamic multi-dimension lift (`bb7671ba`).*
+*Scope: TPU v5e-8 (`v5litepod-8`, single-host 8 chips) · profiles `krea2` (dynamic) and `krea2-1920x1080` (compat alias, now also dynamic).*
 *Spec reference: the checked-in implementation spec at `docs/spec/krea2-tpu-implementation-spec.md` (not yet published; referenced by `deployment/README.md` in the original commits).*
 
 ---
 
 ## 1. Context
 
-ComfyUI has no TPU execution path. The long-term goal is to run multiple image / video / audio models on TPU through the existing node graph. Phase 1 is a single fixed profile on a single slice so the team can prove end-to-end correctness, HBM fit, and operability before generalizing.
+ComfyUI has no TPU execution path. The long-term goal is to run multiple image / video / audio models on TPU through the existing node graph. Krea2 landed as a single profile on a single slice so the team could prove end-to-end correctness, HBM fit, and operability before generalizing, then lifted the shape constraint without a new decision.
 
 **Why Krea2 Turbo first:** standalone diffusion model (no separate transformer split), well-understood BF16 checkpoint, permissive sampler (`er_sde`), and available pinned BF16 artifacts that fit the v5e-8 HBM budget with SPMD sharding.
 
-**Fixed-profile constraint (spec §4):** prompt text + seed are free; every value that changes tensor shapes is frozen:
-
-```
-width=1920 height=1080 batch=1 steps=8 cfg=1
-sampler=er_sde scheduler=simple denoise=1.0 save_prefix=krea2_automatic
-latent (1,16,135,240)  conditioning (B,478,30720)  tokens 512→478
-```
-
-This lets XLA compile once and reuse block programs, avoids recompilation per request, and makes validation decidable.
+**Profile constraint (spec §4, as shipped):** prompt text + seed are free; sampler/scheduler/CFG/batch/save-prefix remain frozen and validated. Dimensions were initially frozen to `width=1920 height=1080` (latent `1×16×135×240`, conditioning `B×478×30720`, tokens `512→478`) so XLA could compile once and reuse block programs. Commit `bb7671ba` lifted the dimension freeze to any `W×H` with `W%8==0 && H%8==0`, `512≤W,H≤2048`, area `262k–2.1M` (`comfy/tpu_profile.py:41` `is_valid_krea2_size()` / `latent_shape_for()`), handled by `pad_to_patch_size` per input — same dtype/sampler, new shapes compile on demand and stay in-memory (`CachedCompile`). This keeps validation decidable while allowing multiple 1M–2M resolutions without a new profile per size.
 
 ---
 
@@ -39,12 +31,12 @@ Add a minimal, gated TPU path that leaves all non-TPU backends (CUDA / ROCm / MP
 
 ### 2.2 CLI & startup ordering (`comfy/cli_args.py`, `main.py`)
 
-- New flags: `--tpu` (requires `--tpu-cache-dir`), `--tpu-profile krea2-1920x1080` (only choice), `--tpu-warmup` / `--no-tpu-warmup` (default on).
+- New flags: `--tpu` (requires `--tpu-cache-dir`), `--tpu-profile {krea2,krea2-1920x1080}` (`krea2` dynamic, `krea2-1920x1080` compat alias now also dynamic; `comfy/cli_args.py:119`, `comfy/tpu_profile.py:16`), `--tpu-warmup` / `--no-tpu-warmup` (default on).
 - `--tpu` conflicts with every GPU/precision/attention/VRAM/fast flag — rejected at parse time with `parser.error`. `--bf16-*` flags are accepted as redundant. `--fp16-intermediates` is rejected (profile pins BF16).
 - `enables_dynamic_vram()` returns `False` under TPU.
 - `main.py` imports `comfy.accelerator` and calls `initialize_accelerator()` **before** `comfy_aimdo` or any `torch.cuda` probing (spec §7 ordering). `cuda_malloc` / `OCL_SET_SVM_SIZE` are skipped under TPU. `comfy_aimdo.control` import is guarded.
 - Warm-up driver (`run_tpu_warmup`) runs before `prompt_server.add_routes()`:
-  `initializing → loading` (verify manifest) → `compiling` (execute canonical workflow `workflows/Krea2-turbo-tpu.json` with correct `execute_outputs`, temp output dir, compile-counter deltas) → `ready` / `failed`. Queue is gated on readiness via `server.py`.
+  `initializing → loading` (verify manifest) → `compiling` (execute canonical workflow `workflows/Krea2-turbo-tpu.json` with correct `execute_outputs`, temp output dir, compile-counter deltas) → `ready` / `failed`. Queue is gated on readiness via `server.py`. Under `krea2` dynamic, warm-up compiles `1920×1080`; additional sizes compile on demand at first use (`UncachedCompile` +14–20) and remain `CachedCompile` thereafter.
 
 ### 2.3 Execution & serving (`execution.py`, `server.py`)
 
@@ -95,7 +87,7 @@ Fixed-length tokenization derived from pinned `qwen25_tokenizer` / `transformers
 
 ### 2.8 Caching & fingerprinting
 
-Inputs to `XLA_PERSISTENT_CACHE_PATH` fingerprint: `torch` + `torch_xla` versions, profile, dtype, mesh shape, policy version, tokenizer constants, latent shape, per-artifact SHA-256. Path: `<cache>/executables/<32-hex>`. `write_cache_profile` dumps inputs alongside cache. On `torch-xla 2.8.0` executable deserialization is unsupported — cache is write-only/diagnostic.
+Inputs to `XLA_PERSISTENT_CACHE_PATH` fingerprint: `torch` + `torch_xla` versions, profile, dtype, mesh shape, policy version, tokenizer constants, latent shape (or `dynamic` for `krea2` so all `W×H` share one cache dir; `comfy/xla_backend.py:104`), per-artifact SHA-256. Path: `<cache>/executables/<32-hex>`. `write_cache_profile` dumps inputs alongside cache. On `torch-xla 2.8.0` executable deserialization is unsupported — cache is write-only/diagnostic; reuse across sizes is in-memory `CachedCompile` (e.g., `1024×1024` 75 s → 4 s, `1080×1920` 56 s → 4–8 s).
 
 ### 2.9 Deployment
 
@@ -106,7 +98,7 @@ Inputs to `XLA_PERSISTENT_CACHE_PATH` fingerprint: `torch` + `torch_xla` version
 | `deployment/stage_models.sh` | Symlinks 3 artifacts from `KREA2_MODEL_ROOT` into `models/{diffusion_models,text_encoders,vae}`. |
 | `deployment/model_manifest.json` | Allowlist + pinned SHA-256 (drift → warm-up fails). |
 | `deployment/hash_artifacts.py` | Pins digests after artifacts placed. |
-| `deployment/launch.sh` | `python main.py --tpu --tpu-cache-dir … --tpu-profile krea2-1920x1080 --tpu-warmup`. |
+| `deployment/launch.sh` | `python main.py --tpu --tpu-cache-dir … --tpu-profile krea2 --tpu-warmup` (also accepts `krea2-1920x1080` compat). |
 | `deployment/healthcheck.sh` | Polls `/tpu/status`; exits 0 only on `ready`. |
 
 ---
@@ -126,19 +118,20 @@ Inputs to `XLA_PERSISTENT_CACHE_PATH` fingerprint: `torch` + `torch_xla` version
 - CUDA / ROCm / MPS / etc. unchanged (all TPU branches gated, default adapter is no-op).
 - Warm-up guarantees the first user request hits a compiled graph; readiness gate prevents serving while inconsistent.
 - Sharding policy is named, versioned, tested, emitted, and fingerprinted — mismatches fail loudly.
+- Dynamic `W×H` shares one profile/cache dir (`latent=dynamic`) and one sharding policy — validated across `1024×1024` / `1080×1920` / `1152×896` / `1280×720` / `1024×768` without per-size profile churn.
 
 **Constraints accepted:**
-- One profile, one slice, BF16 only, no LoRA/ControlNet/patches, no custom device selection. Relaxing any one of these requires a new profile version + policy revision + fingerprint bump.
+- One slice, BF16 only, no LoRA/ControlNet/patches, no custom device selection; sampler/scheduler/CFG/batch/save-prefix remain frozen. Dimensions are now validated within `512–2048` step 8, area `262k–2.1M` rather than fixed `1920×1080`. Relaxing remaining frozen values still requires a new profile version + policy revision + fingerprint bump.
 
 ## 5. Verification
 
-- `python -m pytest tests/tpu -q` → 101 passed headless (real Qwen tokenizer contract included via `tests/tpu/conftest.py` stub accelerator + `--tpu` flag).
-- End-to-end on v5e-8: `deployment/healthcheck.sh` → prompt `workflows/Krea2-turbo-tpu.json` via `/prompt` → `output/krea2_automatic_00001_.png` RGB `1920×1080` (verified 2026-08-16).
+- `python -m pytest tests/tpu -q` → 101 passed headless (real Qwen tokenizer contract included via `tests/tpu/conftest.py` stub accelerator + `--tpu` flag; validator now covers `is_valid_krea2_size`).
+- End-to-end on v5e-8 — fixed: `deployment/healthcheck.sh` → prompt `workflows/Krea2-turbo-tpu.json` via `/prompt` → `output/krea2_automatic_00001_.png` RGB `1920×1080` (verified 2026-08-16; `docs/benchmark/krea2_1920x1080.md`).
+- End-to-end on v5e-8 — dynamic: `krea2` cold 152 s + first at new size 50–75 s then warm `3–8 s` cached / `9–13 s` varying prompt, revisits stay warm; 30 gens across 5 sizes verified RGB (`docs/benchmark/krea2_dynamic.md`, `docs/benchmark/run_dynamic_benchmark.py`).
 
 ---
 
 ## 6. Follow-ups
 
-- Multi-dimension Krea2 (tracked in `docs/progress.md`).
 - Ideogram 4 / MiniMax H3 / PiD upscaler via same adapter boundary (new profiles, new policies, same warm-up/readiness contract).
 - Multi-slice / other accelerators: generalize `DEVICE_COUNT` / `MESH_SHAPE` / topology, keep fingerprint invariant.

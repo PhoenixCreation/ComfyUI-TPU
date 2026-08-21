@@ -5,14 +5,14 @@
 ## Already Done
 
 - [x] Krea2 support — fixed `1920×1080` (`krea2-1920x1080` profile, batch 1, 8 steps, `er_sde`/`simple`, CFG 1.0) — tested on T5e-8
+- [x] Krea2 support — multiple dimensions (lift fixed `1920×1080` constraint) — any `W×H` multiple of 8 in `512–2048` with area `262k–2.1M` (`krea2` dynamic profile, on-demand compile, `bb7671ba`; benchmarks `docs/benchmark/krea2_dynamic.md`)
 
 ## In Progress
 
-- [ ] Krea2 support — multiple dimensions (lift fixed `1920×1080` constraint)
+- [ ] Ideogram 4 support
 
 ## Roadmap
 
-- [ ] Ideogram 4 support
 - [ ] Nvidia PiD upscaling
 - [ ] MiniMax H3 support
 - [ ] Other cluster support (beyond T5e-8)

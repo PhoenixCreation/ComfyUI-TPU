@@ -19,10 +19,10 @@ This project adds **Google Cloud TPU** as a first-class execution backend for Co
 **Design principles:**
 
 - **Gated, not forked** — every TPU code path is behind `--tpu`; without it the process is upstream ComfyUI verbatim. The only module that imports `torch_xla` is `comfy/xla_backend.py`.
-- **Profile-per-phase** — each model lands as a single frozen profile (fixed shapes/dtype/sampler) before being generalized. One profile compilable once is more reliable than many shapes compiled on demand.
+- **Profile-per-phase** — each model lands as a single versioned profile before being generalized. Krea2 shipped fixed `1920×1080` then lifted to dynamic sizes on demand — same sampler/dtype, new shapes compile once and stay cached.
 - **Fail closed** — artifact digest mismatch, unsupported node, or startup compile failure keeps the server non-ready; the queue never serves a partial profile.
 
-See [docs/architecture/overview.md](docs/architecture/overview.md) for the system layout and [docs/architecture/decisions/001-krea2-tpu-support.md](docs/architecture/decisions/001-krea2-tpu-support.md) for the Phase 1 decision record.
+See [docs/architecture/overview.md](docs/architecture/overview.md) for the system layout and [docs/architecture/decisions/001-krea2-tpu-support.md](docs/architecture/decisions/001-krea2-tpu-support.md) for the Krea2 decision record.
 
 ## Progress
 
@@ -30,11 +30,11 @@ See [docs/architecture/overview.md](docs/architecture/overview.md) for the syste
 
 | Stage | What |
 |---|---|
-| **Already done** | **Krea2 Turbo**, fixed `1920×1080`, batch 1, 8 steps, `er_sde`/`simple`, CFG 1.0 — Krea2 diffusion + Qwen3-VL-4B text encoder + Qwen Image VAE — on a single-controller **T5e-8** slice. Verified end-to-end 2026-08-16 (`output/krea2_automatic_00001_.png`, RGB 1920×1080). Warm-up 105.4s, steady-state 32.7s. 101 headless unit tests. |
-| **In progress** | Krea2 — **multi-dimension** support (lift the fixed 1920×1080 constraint). |
-| **Roadmap** | **Ideogram 4** · **Nvidia PiD upscaling** · **MiniMax H3** · **Other clusters** (beyond v5e-8). |
+| **Already done** | **Krea2 Turbo** — Krea2 diffusion + Qwen3-VL-4B text encoder + Qwen Image VAE — on a single-controller **T5e-8** slice. `krea2-1920x1080` (fixed 1920×1080, compat alias) and `krea2` (dynamic: any `W×H` multiple of 8, `512–2048`, area `262k–2.1M`, on-demand compile, warm `3–8 s`). Batch 1, 8 steps, `er_sde`/`simple`, CFG 1.0. Verified 1920×1080 2026-08-16 (`output/krea2_automatic_00001_.png`) and dynamic 1M–2M sizes 2026-08-21 (`docs/benchmark/krea2_dynamic.md`). 101 headless unit tests. |
+| **In progress** | **Ideogram 4**. |
+| **Roadmap** | **Nvidia PiD upscaling** · **MiniMax H3** · **Other clusters** (beyond v5e-8). |
 
-> **Constraint:** Phase 1 only supports the `krea2-1920x1080` profile, T5e-8, BF16, no LoRA/ControlNet/patches. Prompt text and seed are free; every shape-affecting value is validated.
+> **Constraint:** Supports profiles `krea2` (dynamic) and `krea2-1920x1080` (compat alias, now also dynamic), T5e-8, BF16, no LoRA/ControlNet/patches. Prompt text and seed are free; `W×H` validated in `512–2048` step 8 with area `262k–2.1M`, other shape-affecting values (steps/sampler/scheduler/CFG/batch/save prefix) remain fixed and validated.
 
 ## How to Setup
 
@@ -85,8 +85,8 @@ Flags: `--tpu` requires `--tpu-cache-dir`. CUDA/DirectML/VRAM/precision/attentio
 ## What You Should Know
 
 - **Non-TPU backends untouched.** CUDA / ROCm / MPS / XPU / NPU / MLU / DirectML are gated — run without `--tpu` and this repo behaves like upstream.
-- **BF16-only, T5e-8-only (for now).** The profile pins all compute to BF16; the mesh is exactly 8 devices. Other resolutions, clusters, and dtypes are on the roadmap, not in Phase 1.
-- **Prompt freedom:** any text + any seed; dimensions, steps, sampler, scheduler, CFG, and save prefix are fixed and validated pre-queue (`tpu_profile_*` errors).
+- **BF16-only, T5e-8-only (for now).** The profile pins all compute to BF16; the mesh is exactly 8 devices. Multiple 1M–2M resolutions are now supported via `krea2` dynamic (other clusters/dtypes remain on the roadmap).
+- **Prompt freedom:** any text + any seed; `W×H` is validated within `512–2048` step 8 / area `262k–2.1M` (`comfy/tpu_profile.py:41`), steps/sampler/scheduler/CFG/batch/save prefix remain fixed and validated pre-queue (`tpu_profile_*` errors).
 - **No runtime patching.** LoRA, ControlNet, model-patcher hooks/wrappers, and explicit `device` widgets are rejected — TPU placement is process-wide.
 - **Cache is write-only on `torch-xla 2.8.0`.** `TPU_CACHE_DIR` holds diagnostic/sharding reports and compilation entries, but deserialization is unsupported upstream — treat it as restart-diagnostic, not a guaranteed cold-start speedup. Use a fresh empty dir to rule out stale state.
 - **Host memory vs device memory.** Under TPU, VRAM queries report host `available` memory (no HBM query pool). Expect RSS ~24 GiB after a generation; `buff/cache` in `free -h` is reclaimable file cache from the 33 GiB model read, not a leaked process.
@@ -100,7 +100,7 @@ Flags: `--tpu` requires `--tpu-cache-dir`. CUDA/DirectML/VRAM/precision/attentio
 | [docs/deployment.md](docs/deployment.md) | Full deployment, operations, tests, verification, memory notes |
 | [docs/progress.md](docs/progress.md) | Done / in-progress / roadmap (T5e-8 unless noted) |
 | [docs/architecture/overview.md](docs/architecture/overview.md) | System layout, lifecycle, where to look |
-| [docs/architecture/decisions/001-krea2-tpu-support.md](docs/architecture/decisions/001-krea2-tpu-support.md) | Analysis of the Krea2 changes (all 48 files) |
+| [docs/architecture/decisions/001-krea2-tpu-support.md](docs/architecture/decisions/001-krea2-tpu-support.md) | Analysis of the Krea2 changes — fixed + dynamic (single decision) |
 | [docs/reference/comfyui-upstream-README.md](docs/reference/comfyui-upstream-README.md) | Upstream ComfyUI README (verbatim) |
 
 ## Tests
