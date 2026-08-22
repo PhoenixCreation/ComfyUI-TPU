@@ -16,7 +16,9 @@ from typing import Dict, List, Optional
 PROFILE_NAME = "krea2-1920x1080"
 # New dynamic profile alias (same artifacts, relaxed size validation).
 PROFILE_NAME_DYNAMIC = "krea2"
-SUPPORTED_PROFILES = [PROFILE_NAME, PROFILE_NAME_DYNAMIC]
+PROFILE_PID = "pid"
+PROFILE_PID_ALIAS = "upscaler"
+SUPPORTED_PROFILES = [PROFILE_NAME, PROFILE_NAME_DYNAMIC, PROFILE_PID, PROFILE_PID_ALIAS]
 
 # Fixed production profile (spec section 4). Prompt text and seed may vary;
 # every value that affects tensor shapes is fixed. Phase 2 keeps the same
@@ -43,6 +45,48 @@ DYNAMIC_MAX_SIDE = 2048
 DYNAMIC_MIN_AREA = DYNAMIC_MIN_SIDE * DYNAMIC_MIN_SIDE  # 262144
 DYNAMIC_MAX_AREA = 2100000  # ~1920×1080 (2073600) with slack
 DYNAMIC_STEP = 8
+
+# PiD upscaler (Phase A): standalone 1024 longest-edge -> 4x (proposal 003).
+# Input 1024x576 (16:9 from Krea 1920x1080) -> output 4096x2304 is the
+# canonical bucket. PixelDiT pads to patch_size 16, so step is 16.
+PID_INPUT_WIDTH = 1024
+PID_INPUT_HEIGHT = 576
+PID_OUTPUT_WIDTH = 4096
+PID_OUTPUT_HEIGHT = 2304
+PID_UPSCALE_FACTOR = 4
+PID_BATCH_SIZE = 1
+PID_STEPS = 4
+PID_CFG = 1.0
+PID_SAMPLER_NAME = "lcm"
+PID_SCHEDULER = "simple"
+PID_DENOISE = 1.0
+PID_SAVE_PREFIX = "PiD"
+PID_DYNAMIC_STEP = 16
+
+PROFILE_PID_FIXED = {
+    "input_width": PID_INPUT_WIDTH,
+    "input_height": PID_INPUT_HEIGHT,
+    "width": PID_OUTPUT_WIDTH,
+    "height": PID_OUTPUT_HEIGHT,
+    "batch_size": PID_BATCH_SIZE,
+    "steps": PID_STEPS,
+    "cfg": PID_CFG,
+    "sampler_name": PID_SAMPLER_NAME,
+    "scheduler": PID_SCHEDULER,
+    "denoise": PID_DENOISE,
+    "save_prefix": PID_SAVE_PREFIX,
+    "upscale_factor": PID_UPSCALE_FACTOR,
+}
+
+# PiD latent shapes: input Flux VAE (8x) and output pixel space (1:1).
+PID_INPUT_LATENT_SHAPE = (1, 16, PID_INPUT_HEIGHT // 8, PID_INPUT_WIDTH // 8)  # (1,16,72,128)
+PID_OUTPUT_LATENT_SHAPE = (1, 3, PID_OUTPUT_HEIGHT, PID_OUTPUT_WIDTH)  # (1,3,2304,4096)
+
+# PixelDiT tokenizer constants (comfy/text_encoders/pixeldit.py)
+PIXELDIT_FIXED_LEN = 300
+PIXELDIT_CONDITIONING_SEQ = 300
+PIXELDIT_CONDITIONING_FEATURES = 2304
+PIXELDIT_MAX_LENGTH = 300
 
 
 def is_valid_krea2_size(width, height, batch_size=1) -> bool:
@@ -72,6 +116,29 @@ def latent_shape_for(width: int, height: int):
     """Latent shape for an image size: (1, 16, H//8, W//8)."""
     return (1, 16, height // 8, width // 8)
 
+
+def is_valid_pid_size(width, height, batch_size=1) -> bool:
+    """Check whether EmptyChromaRadianceLatentImage dimensions are allowed on TPU.
+
+    Phase A pins exactly 4096x2304x1 (output) derived from 1024x576 input *4.
+    The validator checks the *output* geometry because that is the XLA shape;
+    the input side is validated indirectly via the fixed upscale factor.
+    """
+    if batch_size != PID_BATCH_SIZE:
+        return False
+    if not isinstance(width, int) or not isinstance(height, int):
+        return False
+    if width != PID_OUTPUT_WIDTH or height != PID_OUTPUT_HEIGHT:
+        return False
+    if width % PID_DYNAMIC_STEP != 0 or height % PID_DYNAMIC_STEP != 0:
+        return False
+    return True
+
+
+def latent_shape_for_pid(width: int, height: int):
+    """Pixel-space latent shape for PiD: (1, 3, H, W) — no VAE downsample."""
+    return (1, 3, height, width)
+
 # Tokenizer constants derived from the pinned tokenizer
 # (comfy/text_encoders/qwen25_tokenizer, Qwen2Tokenizer, transformers pinned in
 # deployment/requirements-tpu.txt).
@@ -98,12 +165,18 @@ CONDITIONING_FEATURES = 12 * 2560    # 12 tapped Qwen3-VL-4B hidden states
 
 # Krea2 latent at 1920x1080, batch 1: (1, 16, H/8, W/8) = (1, 16, 135, 240).
 LATENT_SHAPE = (1, 16, PROFILE["height"] // 8, PROFILE["width"] // 8)
+# PiD latents
+PID_LATENT_SHAPE = PID_OUTPUT_LATENT_SHAPE
 
 # Artifact manifest (deployment/model_manifest.json), relative to the repo root.
 _ARTIFACT_DIR_BY_NAME = {
     "krea2_turbo_bf16.safetensors": "diffusion_models",
     "qwen3vl_4b_bf16.safetensors": "text_encoders",
     "qwen_image_vae.safetensors": "vae",
+    "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors": "diffusion_models",
+    "gemma_2_2b_it_elm_bf16.safetensors": "text_encoders",
+    "flux1_vae.safetensors": "vae",
+    "flux1-vae.safetensors": "vae",
 }
 
 
@@ -223,39 +296,24 @@ def _error(code: str, message: str, node_id, observed=None, required=None):
     return {"error": {"type": code, "message": message, "details": message, "extra_info": extra}, "node_errors": {}}
 
 
-def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tuple:
-    """Validate a submitted prompt against the fixed TPU profile.
+def _active_profile() -> str:
+    try:
+        from comfy.cli_args import args as _args
+        return getattr(_args, "tpu_profile", PROFILE_NAME)
+    except Exception:
+        return PROFILE_NAME
 
-    Runs on the prompt graph after node replacement and normal validation, and
-    only over nodes upstream of the requested outputs. Returns
-    (True, None) or (False, error_dict) with a ``tpu_profile_`` error code.
-    """
-    if not prompt:
-        return False, _error("tpu_profile_no_prompt", "TPU profile requires a prompt graph", None)
 
-    if outputs_to_execute:
-        outputs = set(str(nid) for nid in outputs_to_execute)
-    else:
-        consumed = set()
-        for node in prompt.values():
-            for value in node.get("inputs", {}).values():
-                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
-                    consumed.add(str(value[0]))
-        outputs = set(prompt.keys()) - consumed
+_PID_UNSUPPORTED_DYNAMIC = {"GetImageSize", "ComfyMathExpression", "MultiplyNode"}
 
-    nodes = {nid: prompt[nid] for nid in _upstream_nodes(prompt, outputs) if nid in prompt}
-    if not nodes:
-        return False, _error("tpu_profile_no_output_nodes", "TPU profile requires at least one output node", None)
 
+def _validate_krea_prompt(nodes: Dict) -> tuple:
     loaders = {"UNETLoader": False, "CLIPLoader": False, "VAELoader": False}
-    # KSampler and other shape-affecting fields remain fixed; EmptyLatentImage
-    # is dynamic in Phase 2 — any valid Krea2 size compiles on demand.
     fields = {
         "KSampler": {"steps": PROFILE["steps"], "cfg": PROFILE["cfg"], "sampler_name": PROFILE["sampler_name"],
                      "scheduler": PROFILE["scheduler"], "denoise": PROFILE["denoise"]},
     }
     has_save_image = False
-
     for nid, node in nodes.items():
         class_type = node.get("class_type", "")
         inputs = node.get("inputs", {})
@@ -280,14 +338,14 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
 
         if class_type == "UNETLoader":
             loaders["UNETLoader"] = True
-            if inputs.get("unet_name") not in _ARTIFACT_DIR_BY_NAME:
+            if inputs.get("unet_name") not in _ARTIFACT_DIR_BY_NAME or inputs.get("unet_name") != "krea2_turbo_bf16.safetensors":
                 return False, _error("tpu_profile_artifact",
                                      "diffusion model '{}' is not in the approved manifest; expected "
                                      "krea2_turbo_bf16.safetensors".format(inputs.get("unet_name")),
                                      nid, observed=inputs.get("unet_name"), required="krea2_turbo_bf16.safetensors")
         elif class_type == "CLIPLoader":
             loaders["CLIPLoader"] = True
-            if inputs.get("clip_name") not in _ARTIFACT_DIR_BY_NAME:
+            if inputs.get("clip_name") not in _ARTIFACT_DIR_BY_NAME or inputs.get("clip_name") != "qwen3vl_4b_bf16.safetensors":
                 return False, _error("tpu_profile_artifact",
                                      "text encoder '{}' is not in the approved manifest; expected "
                                      "qwen3vl_4b_bf16.safetensors".format(inputs.get("clip_name")),
@@ -298,11 +356,12 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
                                      nid, observed=inputs.get("type"), required="krea2")
         elif class_type == "VAELoader":
             loaders["VAELoader"] = True
-            if inputs.get("vae_name") not in _ARTIFACT_DIR_BY_NAME:
+            vae_name = inputs.get("vae_name")
+            if vae_name != "qwen_image_vae.safetensors":
                 return False, _error("tpu_profile_artifact",
                                      "VAE '{}' is not in the approved manifest; expected "
-                                     "qwen_image_vae.safetensors".format(inputs.get("vae_name")),
-                                     nid, observed=inputs.get("vae_name"), required="qwen_image_vae.safetensors")
+                                     "qwen_image_vae.safetensors".format(vae_name),
+                                     nid, observed=vae_name, required="qwen_image_vae.safetensors")
         elif class_type == "EmptyLatentImage":
             w = inputs.get("width")
             h = inputs.get("height")
@@ -358,6 +417,193 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
                              "the acceptance profile requires a SaveImage output node", None)
 
     return True, None
+
+
+def _validate_pid_prompt(nodes: Dict) -> tuple:
+    has_unet = False
+    has_clip = False
+    has_flux_vae = False
+    has_pixel_vae = False
+    has_empty_chroma = False
+    has_pid_conditioning = False
+    has_save = False
+
+    for nid, node in nodes.items():
+        class_type = node.get("class_type", "")
+        inputs = node.get("inputs", {})
+
+        if class_type in _UNSUPPORTED_LOADERS:
+            return False, _error("tpu_profile_unsupported_loader",
+                                 "{} is not supported on TPU: use the native UNETLoader/CLIPLoader/VAELoader "
+                                 "nodes; TPU device placement is process-wide".format(class_type), nid,
+                                 observed=class_type, required="native loader")
+        if class_type in _UNSUPPORTED_MUTATIONS:
+            return False, _error("tpu_profile_unsupported_mutation",
+                                 "{} is not supported on TPU: LoRA, model patches, ControlNet, and "
+                                 "reference-image conditioning are outside the Phase 1 profile".format(class_type),
+                                 nid, observed=class_type, required="no mutations")
+        # dynamic geometry nodes are not allowed in fixed Phase A
+        if class_type in _PID_UNSUPPORTED_DYNAMIC:
+            return False, _error("tpu_profile_dynamic_geometry",
+                                 "{} is not supported on TPU for the fixed {} profile: the canonical Upscaler-tpu.json "
+                                 "hardcodes {}x{} geometry".format(class_type, PROFILE_PID, PID_OUTPUT_WIDTH, PID_OUTPUT_HEIGHT),
+                                 nid, observed=class_type, required="native fixed geometry")
+        for key, value in inputs.items():
+            if isinstance(value, str) and ("cuda" in value.lower() or "xpu" in value.lower()):
+                return False, _error("tpu_profile_cuda_device",
+                                     "{} on node {} requests device '{}'; TPU placement is process-wide and "
+                                     "device widgets are not supported".format(key, nid, value),
+                                     nid, observed=value, required="no explicit device")
+
+        if class_type == "UNETLoader":
+            has_unet = True
+            if inputs.get("unet_name") != "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors":
+                return False, _error("tpu_profile_artifact",
+                                     "diffusion model '{}' is not in the approved manifest; expected "
+                                     "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors".format(inputs.get("unet_name")),
+                                     nid, observed=inputs.get("unet_name"), required="pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors")
+        elif class_type == "CLIPLoader":
+            has_clip = True
+            if inputs.get("clip_name") != "gemma_2_2b_it_elm_bf16.safetensors":
+                return False, _error("tpu_profile_artifact",
+                                     "text encoder '{}' is not in the approved manifest; expected "
+                                     "gemma_2_2b_it_elm_bf16.safetensors".format(inputs.get("clip_name")),
+                                     nid, observed=inputs.get("clip_name"), required="gemma_2_2b_it_elm_bf16.safetensors")
+            if inputs.get("type") != "pixeldit":
+                return False, _error("tpu_profile_invalid_clip_type",
+                                     "CLIPLoader type must be 'pixeldit' for the PiD profile",
+                                     nid, observed=inputs.get("type"), required="pixeldit")
+        elif class_type == "VAELoader":
+            vae_name = inputs.get("vae_name")
+            if vae_name in ("flux1_vae.safetensors", "flux1-vae.safetensors"):
+                has_flux_vae = True
+            elif vae_name == "pixel_space":
+                has_pixel_vae = True
+            else:
+                return False, _error("tpu_profile_artifact",
+                                     "VAE '{}' is not in the approved manifest; expected flux1_vae.safetensors or pixel_space".format(vae_name),
+                                     nid, observed=vae_name, required="flux1_vae.safetensors|pixel_space")
+        elif class_type == "EmptyChromaRadianceLatentImage":
+            has_empty_chroma = True
+            w = inputs.get("width")
+            h = inputs.get("height")
+            b = inputs.get("batch_size", 1)
+            if not is_valid_pid_size(w, h, b):
+                return False, _error("tpu_profile_wrong_latent_shape",
+                                     "EmptyChromaRadianceLatentImage {}x{} does not satisfy PiD fixed profile {}x{} step {}".format(
+                                         w, h, PID_OUTPUT_WIDTH, PID_OUTPUT_HEIGHT, PID_DYNAMIC_STEP),
+                                     nid, observed=f"{w}x{h}", required=f"{PID_OUTPUT_WIDTH}x{PID_OUTPUT_HEIGHT}")
+        elif class_type == "PiDConditioning":
+            has_pid_conditioning = True
+            if inputs.get("latent_format") != "flux":
+                return False, _error("tpu_profile_invalid_latent_format",
+                                     "PiDConditioning latent_format must be 'flux' for the PiD profile",
+                                     nid, observed=inputs.get("latent_format"), required="flux")
+            try:
+                sigma = float(inputs.get("degrade_sigma", 0))
+            except Exception:
+                sigma = None
+            if sigma != 0.0:
+                return False, _error("tpu_profile_wrong_degrade_sigma",
+                                     "PiDConditioning degrade_sigma must be 0 for the fixed PiD profile",
+                                     nid, observed=inputs.get("degrade_sigma"), required=0.0)
+        elif class_type == "BasicScheduler":
+            if inputs.get("scheduler") != PID_SCHEDULER:
+                return False, _error("tpu_profile_wrong_scheduler",
+                                     "scheduler value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("scheduler"), PROFILE_PID, PID_SCHEDULER),
+                                     nid, observed=inputs.get("scheduler"), required=PID_SCHEDULER)
+            if inputs.get("steps") != PID_STEPS:
+                return False, _error("tpu_profile_wrong_steps",
+                                     "steps value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("steps"), PROFILE_PID, PID_STEPS),
+                                     nid, observed=inputs.get("steps"), required=PID_STEPS)
+            if inputs.get("denoise") != PID_DENOISE:
+                return False, _error("tpu_profile_wrong_denoise",
+                                     "denoise value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("denoise"), PROFILE_PID, PID_DENOISE),
+                                     nid, observed=inputs.get("denoise"), required=PID_DENOISE)
+        elif class_type == "KSamplerSelect":
+            if inputs.get("sampler_name") != PID_SAMPLER_NAME:
+                return False, _error("tpu_profile_wrong_sampler_name",
+                                     "sampler_name value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("sampler_name"), PROFILE_PID, PID_SAMPLER_NAME),
+                                     nid, observed=inputs.get("sampler_name"), required=PID_SAMPLER_NAME)
+        elif class_type == "SamplerCustom":
+            if inputs.get("cfg") != PID_CFG:
+                return False, _error("tpu_profile_wrong_cfg",
+                                     "cfg value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("cfg"), PROFILE_PID, PID_CFG),
+                                     nid, observed=inputs.get("cfg"), required=PID_CFG)
+        elif class_type == "ImageScale":
+            w = inputs.get("width")
+            h = inputs.get("height")
+            # only allow fixed integer geometry, not graph-wired expressions
+            if isinstance(w, list) or isinstance(h, list):
+                return False, _error("tpu_profile_dynamic_geometry",
+                                     "ImageScale with wired width/height is not supported on TPU for the fixed {} profile".format(PROFILE_PID),
+                                     nid, observed=str(w if isinstance(w, list) else h), required=f"{PID_INPUT_WIDTH}x{PID_INPUT_HEIGHT}")
+        elif class_type == "SaveImage":
+            has_save = True
+            if inputs.get("filename_prefix") != PID_SAVE_PREFIX:
+                return False, _error("tpu_profile_wrong_save_prefix",
+                                     "SaveImage prefix '{}' does not match the profile prefix '{}'".format(
+                                         inputs.get("filename_prefix"), PID_SAVE_PREFIX),
+                                     nid, observed=inputs.get("filename_prefix"), required=PID_SAVE_PREFIX)
+
+    if not has_unet:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires a UNETLoader for pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors", None, observed="UNETLoader", required="UNETLoader")
+    if not has_clip:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires a CLIPLoader for gemma_2_2b_it_elm_bf16.safetensors", None, observed="CLIPLoader", required="CLIPLoader")
+    if not has_flux_vae:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires a VAELoader for flux1_vae.safetensors", None, observed="VAELoader", required="flux1_vae.safetensors")
+    if not has_pixel_vae:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires a VAELoader for pixel_space", None, observed="VAELoader", required="pixel_space")
+    if not has_empty_chroma:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires an EmptyChromaRadianceLatentImage", None, observed="EmptyChromaRadianceLatentImage", required="EmptyChromaRadianceLatentImage")
+    if not has_pid_conditioning:
+        return False, _error("tpu_profile_missing_loader", "the PiD profile requires a PiDConditioning node", None, observed="PiDConditioning", required="PiDConditioning")
+    if not has_save:
+        return False, _error("tpu_profile_missing_save", "the acceptance profile requires a SaveImage output node", None)
+    return True, None
+
+
+def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tuple:
+    """Validate a submitted prompt against the fixed TPU profile.
+
+    Runs on the prompt graph after node replacement and normal validation, and
+    only over nodes upstream of the requested outputs. Returns
+    (True, None) or (False, error_dict) with a ``tpu_profile_`` error code.
+    """
+    if not prompt:
+        return False, _error("tpu_profile_no_prompt", "TPU profile requires a prompt graph", None)
+
+    if outputs_to_execute:
+        outputs = set(str(nid) for nid in outputs_to_execute)
+    else:
+        consumed = set()
+        for node in prompt.values():
+            for value in node.get("inputs", {}).values():
+                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], (str, int)):
+                    consumed.add(str(value[0]))
+        outputs = set(prompt.keys()) - consumed
+
+    nodes = {nid: prompt[nid] for nid in _upstream_nodes(prompt, outputs) if nid in prompt}
+    if not nodes:
+        return False, _error("tpu_profile_no_output_nodes", "TPU profile requires at least one output node", None)
+
+    is_pid = _active_profile() in (PROFILE_PID, PROFILE_PID_ALIAS)
+    # Auto-detect PiD graph when profile is not yet configured (e.g. tests that
+    # do not set args.tpu_profile): if the upstream graph contains a PiD
+    # marker node, validate against the PiD profile.
+    if not is_pid:
+        has_pid_marker = any(n.get("class_type") in ("PiDConditioning", "EmptyChromaRadianceLatentImage") for n in nodes.values())
+        if has_pid_marker:
+            is_pid = True
+
+    if is_pid:
+        return _validate_pid_prompt(nodes)
+    return _validate_krea_prompt(nodes)
 
 
 class ReadinessTracker:

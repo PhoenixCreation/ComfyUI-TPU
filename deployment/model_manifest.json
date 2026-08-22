@@ -1,6 +1,6 @@
 {
-  "profile": "krea2-1920x1080",
-  "comment": "Pinned Krea2 artifacts (implementation spec section 3). Paths are relative to the repo root. sha256 is pinned by deployment/hash_artifacts.py after artifacts are placed (empty string = not yet pinned; warm-up refuses to start until every digest is pinned). source.repository/revision are operator metadata recorded at setup; leave empty when the artifact provenance is not declared.",
+  "profile": "multi",
+  "comment": "Pinned artifacts for Krea2 + PiD upscaler (implementation spec sections 3/12). Paths are relative to the repo root. sha256 is pinned by deployment/hash_artifacts.py after artifacts are placed (empty string = not yet pinned; warm-up refuses to start until every digest is pinned). source.repository/revision are operator metadata recorded at setup; leave empty when the artifact provenance is not declared.",
   "artifacts": {
     "krea2_turbo_bf16.safetensors": {
       "path": "models/diffusion_models/krea2_turbo_bf16.safetensors",
@@ -28,6 +28,33 @@
         "revision": ""
       },
       "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+    },
+    "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors": {
+      "path": "models/diffusion_models/pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors",
+      "dtype": "bf16",
+      "source": {
+        "repository": "/kaggle/input/models/helltester2/pid-upscaler-bf16",
+        "revision": "transformers/default/1"
+      },
+      "sha256": "18931256e97822dc31db10b1e7399c73e7ee2c897f6d461eb1d1cf5e1d2de049"
+    },
+    "gemma_2_2b_it_elm_bf16.safetensors": {
+      "path": "models/text_encoders/gemma_2_2b_it_elm_bf16.safetensors",
+      "dtype": "bf16",
+      "source": {
+        "repository": "/kaggle/input/models/helltester2/pid-upscaler-bf16",
+        "revision": "transformers/default/1"
+      },
+      "sha256": "e7ae59c203c392db4aa4e27783e924ec3225eb563392260cf747e1130ffcdb88"
+    },
+    "flux1_vae.safetensors": {
+      "path": "models/vae/flux1_vae.safetensors",
+      "dtype": "f32",
+      "source": {
+        "repository": "/kaggle/input/models/helltester2/pid-upscaler-bf16",
+        "revision": "transformers/default/1"
+      },
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
     }
   }
 }

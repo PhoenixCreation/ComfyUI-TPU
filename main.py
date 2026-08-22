@@ -502,6 +502,7 @@ def run_tpu_warmup(prompt_server):
     from comfy import tpu_profile
 
     readiness = tpu_profile.readiness
+    readiness.profile = getattr(args, "tpu_profile", readiness.profile)
     readiness.cache_dir = args.tpu_cache_dir
     readiness.transition("loading")
 
@@ -530,7 +531,13 @@ def run_tpu_warmup(prompt_server):
 
     readiness.transition("compiling")
     try:
-        workflow_path = os.path.join(tpu_profile.repo_root(), "workflows", "Krea2-turbo-tpu.json")
+        # Profile-aware warmup workflow (krea vs pid).
+        profile = getattr(args, "tpu_profile", tpu_profile.PROFILE_NAME)
+        if profile in (tpu_profile.PROFILE_PID, tpu_profile.PROFILE_PID_ALIAS):
+            workflow_file = "Upscaler-tpu.json"
+        else:
+            workflow_file = "Krea2-turbo-tpu.json"
+        workflow_path = os.path.join(tpu_profile.repo_root(), "workflows", workflow_file)
         with open(workflow_path) as f:
             warmup_prompt = json.load(f)
 

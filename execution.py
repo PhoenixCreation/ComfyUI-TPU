@@ -736,7 +736,9 @@ class PromptExecutor:
         if tpu_tracked:
             from comfy.accelerator import StageTracker, set_current_tracker
             from comfy import tpu_profile
-            tracker = StageTracker(prompt_id, tpu_profile.PROFILE_NAME)
+            from comfy.cli_args import args as _args
+            _profile = getattr(_args, "tpu_profile", tpu_profile.PROFILE_NAME)
+            tracker = StageTracker(prompt_id, _profile)
             tracker.begin_interval()
             tracker.record("create_time", extra_data.get("create_time"))
             tracker.record("compile_counters_before", comfy.accelerator.compile_counters())

@@ -36,12 +36,22 @@ def test_conditioning_shapes():
 def test_manifest_covers_all_three_artifacts():
     m = tpu_profile.load_manifest()
     artifacts = m.get("artifacts", {})
-    assert set(artifacts) == {
+    assert {
         "krea2_turbo_bf16.safetensors",
         "qwen3vl_4b_bf16.safetensors",
         "qwen_image_vae.safetensors",
-    }
+    }.issubset(set(artifacts))
     for name, info in artifacts.items():
-        assert info["dtype"] == "bf16"
         assert "sha256" in info
         assert "path" in info
+        assert info["dtype"] in ("bf16", "f32")
+
+
+def test_manifest_covers_pid_artifacts():
+    m = tpu_profile.load_manifest()
+    artifacts = m.get("artifacts", {})
+    assert {
+        "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors",
+        "gemma_2_2b_it_elm_bf16.safetensors",
+        "flux1_vae.safetensors",
+    }.issubset(set(artifacts))

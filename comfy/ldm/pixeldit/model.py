@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import comfy.accelerator
 import comfy.ldm.common_dit
+import comfy.model_management
 import comfy.patcher_extension
 from comfy.ldm.flux.math import apply_rope, rope
 from comfy.ldm.hidream.model import FeedForwardSwiGLU
@@ -227,6 +229,8 @@ class PixDiT_T2I(nn.Module):
         for i, blk in enumerate(self.patch_blocks):
             s = self._pre_patch_block(s, i, **kwargs)
             s, y_emb = blk(s, y_emb, condition, pos_img, pos_txt, None, transformer_options=transformer_options)
+            if comfy.model_management.xla_enabled():
+                comfy.accelerator.mark_step()
         s = F.silu(t_emb + s)
 
         s = self._pre_pixel_blocks(s, **kwargs)
@@ -234,6 +238,8 @@ class PixDiT_T2I(nn.Module):
         x_pixels = self.pixel_embedder(x, patch_size=self.patch_size)
         for blk in self.pixel_blocks:
             x_pixels = blk(x_pixels, s_cond, H, W, self.patch_size, mask=None, transformer_options=transformer_options)
+            if comfy.model_management.xla_enabled():
+                comfy.accelerator.mark_step()
 
         x_pixels = self.final_layer(x_pixels)
         C_out = self.out_channels

@@ -105,21 +105,30 @@ class XlaAccelerator:
         # Dynamic Krea2 sizes share one persistent-cache directory; the cache
         # key includes program shape, so per-size executables are distinct
         # inside the directory. Keep the fixed profile's hash stable.
-        if args.tpu_profile == getattr(tpu_profile, "PROFILE_NAME_DYNAMIC", None):
+        if args.tpu_profile in (getattr(tpu_profile, "PROFILE_PID", None), getattr(tpu_profile, "PROFILE_PID_ALIAS", None)):
+            latent_str = f"{tpu_profile.PID_OUTPUT_WIDTH}x{tpu_profile.PID_OUTPUT_HEIGHT}"
+            tokens_str = f"pixeldit={tpu_profile.PIXELDIT_FIXED_LEN}"
+        elif args.tpu_profile == getattr(tpu_profile, "PROFILE_NAME_DYNAMIC", None):
             latent_str = "dynamic"
+            tokens_str = "%d:%d:%d" % (
+                tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
+                tpu_profile.TOKENIZER_PREFIX_TOKENS,
+                tpu_profile.TOKENIZER_CLOSING_TOKENS,
+            )
         else:
             latent_str = str(list(tpu_profile.LATENT_SHAPE))
+            tokens_str = "%d:%d:%d" % (
+                tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
+                tpu_profile.TOKENIZER_PREFIX_TOKENS,
+                tpu_profile.TOKENIZER_CLOSING_TOKENS,
+            )
         parts = [
             "torch=" + torch.__version__,
             "profile=" + args.tpu_profile,
             "dtype=bf16",
             "mesh=%s" % (MESH_SHAPE,),
             "policy=" + tpu_sharding.POLICY_VERSION,
-            "tokens=%d:%d:%d" % (
-                tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
-                tpu_profile.TOKENIZER_PREFIX_TOKENS,
-                tpu_profile.TOKENIZER_CLOSING_TOKENS,
-            ),
+            "tokens=%s" % tokens_str,
             "latent=%s" % latent_str,
         ]
         manifest = tpu_profile.load_manifest()
@@ -365,6 +374,20 @@ class XlaAccelerator:
         base = os.path.join(self.tpu_cache_dir, "executables")
         os.makedirs(base, exist_ok=True)
         path = os.path.join(self.tpu_cache_dir, "cache_profile.json")
+        if args.tpu_profile in (getattr(tpu_profile, "PROFILE_PID", None), getattr(tpu_profile, "PROFILE_PID_ALIAS", None)):
+            tokenizer_constants = {
+                "pixeldit_fixed_len": tpu_profile.PIXELDIT_FIXED_LEN,
+                "pixeldit_conditioning_seq": tpu_profile.PIXELDIT_CONDITIONING_SEQ,
+                "pixeldit_conditioning_features": tpu_profile.PIXELDIT_CONDITIONING_FEATURES,
+                "pid_input": list(tpu_profile.PID_INPUT_LATENT_SHAPE),
+                "pid_output": list(tpu_profile.PID_OUTPUT_LATENT_SHAPE),
+            }
+        else:
+            tokenizer_constants = {
+                "fixed_input_len": tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
+                "prefix_tokens": tpu_profile.TOKENIZER_PREFIX_TOKENS,
+                "closing_tokens": tpu_profile.TOKENIZER_CLOSING_TOKENS,
+            }
         payload = {
             "profile": args.tpu_profile,
             "torch": torch.__version__,
@@ -372,11 +395,7 @@ class XlaAccelerator:
             "axis_names": MESH_AXIS_NAMES,
             "policy_version": tpu_sharding.POLICY_VERSION,
             "dtype": "bf16",
-            "tokenizer_constants": {
-                "fixed_input_len": tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
-                "prefix_tokens": tpu_profile.TOKENIZER_PREFIX_TOKENS,
-                "closing_tokens": tpu_profile.TOKENIZER_CLOSING_TOKENS,
-            },
+            "tokenizer_constants": tokenizer_constants,
             "manifest": json.loads(json.dumps(tpu_profile.load_manifest().get("artifacts", {}))),
         }
         with open(path, "w") as f:

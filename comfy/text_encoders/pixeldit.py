@@ -1,5 +1,7 @@
 import torch
 
+import comfy.accelerator
+import comfy.model_management
 from comfy import sd1_clip
 from .lumina2 import Gemma2BTokenizer, LuminaModel
 import comfy.text_encoders.llama
@@ -79,7 +81,11 @@ class PixelDiTGemma2TE(LuminaModel):
                          clip_model=PixelDiTGemma2_2BModel, model_options=model_options)
 
     def encode_token_weights(self, token_weight_pairs):
-        result = super().encode_token_weights(token_weight_pairs)
+        if comfy.model_management.xla_enabled():
+            with comfy.accelerator.stage_timer("text_encoder"):
+                result = super().encode_token_weights(token_weight_pairs)
+        else:
+            result = super().encode_token_weights(token_weight_pairs)
         cond, pooled = result[0], result[1]
         extra = result[2] if len(result) > 2 else None
         if cond.shape[1] > _PIXELDIT_MAX_LENGTH:
@@ -87,6 +93,14 @@ class PixelDiTGemma2TE(LuminaModel):
             if extra is not None and "attention_mask" in extra:
                 am = extra["attention_mask"]
                 extra["attention_mask"] = torch.cat([am[..., :1], am[..., -(_PIXELDIT_MAX_LENGTH - 1):]], dim=-1)
+        # TPU fixed conditioning shape: always (B, 300, 2304)
+        if comfy.model_management.xla_enabled():
+            extra = dict(extra) if extra is not None else {}
+            # Keep attention_mask shape-stable; never pop on TPU to avoid .sum() sync.
+            comfy.accelerator.mark_step()
+            if extra:
+                return cond, pooled, extra
+            return cond, pooled
         if extra is not None:
             return cond, pooled, extra
         return cond, pooled

@@ -14,7 +14,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 MESH_AXIS = "model"
-POLICY_VERSION = "krea2-tpu-v1"
+POLICY_VERSION = "krea2-pid-tpu-v1"
 
 # Partition dimension: "rows" = output rows of the weight matrix (x @ W^T),
 # "cols" = input/contraction columns of the weight matrix.
@@ -78,6 +78,61 @@ _QWEN3VL_RULES = [
 # are replicated).
 _VAE_RULES = []
 
+# PiD diffusion (PixDiT_T2I + PiT + LQ branch). All large matmuls are
+# divisible by the 8-device mesh (verified 2026-08-22: 4608/9216/4096/1536 etc
+# all %8==0). Tiny SigmaAwareGate content_proj (1,3072) and log_alpha scalars
+# plus PiT's small norm/mlpfc are replicated explicitly.
+_PID_RULES = [
+    ("content_proj.weight", _REPLICATE),
+    ("log_alpha", _REPLICATE),
+    ("spiece_model", _REPLICATE),
+    (".norm", _REPLICATE),
+    (".mlp.fc", _REPLICATE),
+    (".pixel_embedder.proj.weight", _REPLICATE),
+    (".attn.qkv", _ROW_PARTITION),
+    (".attn.qkv_x.weight", _ROW_PARTITION),
+    (".attn.qkv_y.weight", _ROW_PARTITION),
+    (".attn.qkv.weight", _ROW_PARTITION),
+    (".attn.proj", _COL_PARTITION),
+    (".attn.proj_x.weight", _COL_PARTITION),
+    (".attn.proj_y.weight", _COL_PARTITION),
+    (".compress_to_attn.weight", _ROW_PARTITION),
+    (".expand_from_attn.weight", _COL_PARTITION),
+    (".adaLN_modulation", _ROW_PARTITION),
+    (".mlp_x.w", _ROW_PARTITION),
+    (".mlp_y.w", _ROW_PARTITION),
+    (".mlp_x.w2.weight", _COL_PARTITION),
+    (".mlp_y.w2.weight", _COL_PARTITION),
+    (".output_heads", _ROW_PARTITION),
+    (".pit_head", _ROW_PARTITION),
+    (".latent_proj", _REPLICATE),
+    (".s_embedder", _ROW_PARTITION),
+    (".y_embedder.proj.weight", _ROW_PARTITION),
+    (".t_embedder.mlp", _ROW_PARTITION),
+]
+
+# Gemma2-2B (pixeldit): vocab lookup and SPM replicated, attention/MLP sharded.
+# GQA k/v 1024 are divisible by 8 (8*128) so no Krea-style 1280 exception.
+_GEMMA2B_RULES = [
+    ("embed_tokens.weight", _REPLICATE),
+    ("spiece_model", _REPLICATE),
+    ("input_layernorm.weight", _REPLICATE),
+    ("post_attention_layernorm.weight", _REPLICATE),
+    ("post_feedforward_layernorm.weight", _REPLICATE),
+    ("pre_feedforward_layernorm.weight", _REPLICATE),
+    ("model.norm.weight", _REPLICATE),
+    (".self_attn.q_proj.weight", _ROW_PARTITION),
+    (".self_attn.k_proj.weight", _ROW_PARTITION),
+    (".self_attn.v_proj.weight", _ROW_PARTITION),
+    (".self_attn.o_proj.weight", _COL_PARTITION),
+    (".mlp.gate_proj.weight", _ROW_PARTITION),
+    (".mlp.up_proj.weight", _ROW_PARTITION),
+    (".mlp.down_proj.weight", _COL_PARTITION),
+]
+
+# Flux VAE (for PiD LQ encode): F32 conv kernels — replicate (same as Qwen VAE).
+_FLUX_VAE_RULES = []
+
 
 def _fallback_spec(shape: Tuple[int, ...]) -> str:
     if len(shape) == 2:
@@ -140,6 +195,15 @@ def policy_for_artifact(artifact: str) -> ShardingPolicy:
         return ShardingPolicy(artifact, _QWEN3VL_RULES)
     if artifact == "qwen_image_vae.safetensors":
         return ShardingPolicy(artifact, _VAE_RULES)
+    if artifact == "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors":
+        return ShardingPolicy(artifact, _PID_RULES)
+    if artifact == "gemma_2_2b_it_elm_bf16.safetensors":
+        return ShardingPolicy(artifact, _GEMMA2B_RULES)
+    if artifact in ("flux1_vae.safetensors", "flux1-vae.safetensors"):
+        return ShardingPolicy(artifact, _FLUX_VAE_RULES)
+    if artifact == "pixel_space":
+        # Virtual VAE (comfy/pixel_space_convert.py) – single param, no sharding benefit.
+        return ShardingPolicy(artifact, [])
     raise ValueError("no sharding policy for artifact: {}".format(artifact))
 
 

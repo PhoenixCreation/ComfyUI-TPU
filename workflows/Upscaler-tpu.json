@@ -1,0 +1,223 @@
+{
+  "10": {
+    "inputs": {
+      "vae_name": "flux1_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE (Flux)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "vae_name": "pixel_space"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE (Pixel Space)"
+    }
+  },
+  "12": {
+    "inputs": {
+      "clip_name": "gemma_2_2b_it_elm_bf16.safetensors",
+      "type": "pixeldit"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIPLoader (PiD BF16)"
+    }
+  },
+  "13": {
+    "inputs": {
+      "unet_name": "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNETLoader (PiD BF16)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "image": "pid_test_input_1920x1080.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image (1920x1080)"
+    }
+  },
+  "15": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      "width": 1024,
+      "height": 576,
+      "crop": "disabled",
+      "image": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "ImageScale",
+    "_meta": {
+      "title": "ImageScale 1024x576"
+    }
+  },
+  "16": {
+    "inputs": {
+      "pixels": [
+        "15",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode (Flux)"
+    }
+  },
+  "17": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "18": {
+    "inputs": {
+      "conditioning": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "ConditioningZeroOut"
+    }
+  },
+  "19": {
+    "inputs": {
+      "positive": [
+        "17",
+        0
+      ],
+      "latent": [
+        "16",
+        0
+      ],
+      "latent_format": "flux",
+      "degrade_sigma": 0
+    },
+    "class_type": "PiDConditioning",
+    "_meta": {
+      "title": "PiD Conditioning"
+    }
+  },
+  "20": {
+    "inputs": {
+      "width": 4096,
+      "height": 2304,
+      "batch_size": 1
+    },
+    "class_type": "EmptyChromaRadianceLatentImage",
+    "_meta": {
+      "title": "EmptyChromaRadianceLatentImage"
+    }
+  },
+  "21": {
+    "inputs": {
+      "sampler_name": "lcm"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "22": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 4,
+      "denoise": 1,
+      "model": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "23": {
+    "inputs": {
+      "add_noise": true,
+      "noise_seed": 42,
+      "cfg": 1,
+      "model": [
+        "13",
+        0
+      ],
+      "positive": [
+        "19",
+        0
+      ],
+      "negative": [
+        "18",
+        0
+      ],
+      "sampler": [
+        "21",
+        0
+      ],
+      "sigmas": [
+        "22",
+        0
+      ],
+      "latent_image": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "SamplerCustom",
+    "_meta": {
+      "title": "SamplerCustom"
+    }
+  },
+  "24": {
+    "inputs": {
+      "samples": [
+        "23",
+        0
+      ],
+      "vae": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode (Pixel Space)"
+    }
+  },
+  "25": {
+    "inputs": {
+      "filename_prefix": "PiD",
+      "images": [
+        "24",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image (PiD)"
+    }
+  }
+}
