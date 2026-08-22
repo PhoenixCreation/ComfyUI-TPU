@@ -138,7 +138,7 @@ class PixDiT_T2I(nn.Module):
         dtype=None,
         device=None,
         operations=None,
-        pixel_mlp_chunks=2,
+        pixel_mlp_chunks=8,
     ):
         super().__init__()
         self.dtype = dtype

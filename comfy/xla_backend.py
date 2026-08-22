@@ -108,6 +108,9 @@ class XlaAccelerator:
         if args.tpu_profile in (getattr(tpu_profile, "PROFILE_PID", None), getattr(tpu_profile, "PROFILE_PID_ALIAS", None)):
             latent_str = f"{tpu_profile.PID_OUTPUT_WIDTH}x{tpu_profile.PID_OUTPUT_HEIGHT}"
             tokens_str = f"pixeldit={tpu_profile.PIXELDIT_FIXED_LEN}"
+        elif args.tpu_profile in (getattr(tpu_profile, "PROFILE_KREA_PID", None), getattr(tpu_profile, "PROFILE_KREA_PID_ALIAS", None), getattr(tpu_profile, "PROFILE_KREA_PID_ALIAS2", None)):
+            latent_str = f"{tpu_profile.KREA_PID_KREA_WIDTH}x{tpu_profile.KREA_PID_KREA_HEIGHT}->{tpu_profile.KREA_PID_PID_WIDTH}x{tpu_profile.KREA_PID_PID_HEIGHT}"
+            tokens_str = f"krea={tpu_profile.TOKENIZER_FIXED_INPUT_LEN}:{tpu_profile.TOKENIZER_PREFIX_TOKENS}:{tpu_profile.TOKENIZER_CLOSING_TOKENS}+pixeldit={tpu_profile.PIXELDIT_FIXED_LEN}"
         elif args.tpu_profile == getattr(tpu_profile, "PROFILE_NAME_DYNAMIC", None):
             latent_str = "dynamic"
             tokens_str = "%d:%d:%d" % (
@@ -379,6 +382,18 @@ class XlaAccelerator:
                 "pixeldit_fixed_len": tpu_profile.PIXELDIT_FIXED_LEN,
                 "pixeldit_conditioning_seq": tpu_profile.PIXELDIT_CONDITIONING_SEQ,
                 "pixeldit_conditioning_features": tpu_profile.PIXELDIT_CONDITIONING_FEATURES,
+                "pid_input": list(tpu_profile.PID_INPUT_LATENT_SHAPE),
+                "pid_output": list(tpu_profile.PID_OUTPUT_LATENT_SHAPE),
+            }
+        elif args.tpu_profile in (getattr(tpu_profile, "PROFILE_KREA_PID", None), getattr(tpu_profile, "PROFILE_KREA_PID_ALIAS", None), getattr(tpu_profile, "PROFILE_KREA_PID_ALIAS2", None)):
+            tokenizer_constants = {
+                "fixed_input_len": tpu_profile.TOKENIZER_FIXED_INPUT_LEN,
+                "prefix_tokens": tpu_profile.TOKENIZER_PREFIX_TOKENS,
+                "closing_tokens": tpu_profile.TOKENIZER_CLOSING_TOKENS,
+                "pixeldit_fixed_len": tpu_profile.PIXELDIT_FIXED_LEN,
+                "pixeldit_conditioning_seq": tpu_profile.PIXELDIT_CONDITIONING_SEQ,
+                "pixeldit_conditioning_features": tpu_profile.PIXELDIT_CONDITIONING_FEATURES,
+                "krea_latent": [1, 16, tpu_profile.KREA_PID_KREA_HEIGHT // 8, tpu_profile.KREA_PID_KREA_WIDTH // 8],
                 "pid_input": list(tpu_profile.PID_INPUT_LATENT_SHAPE),
                 "pid_output": list(tpu_profile.PID_OUTPUT_LATENT_SHAPE),
             }

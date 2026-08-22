@@ -14,7 +14,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 MESH_AXIS = "model"
-POLICY_VERSION = "krea2-pid-tpu-v1"
+POLICY_VERSION = "krea2-pid-tpu-v2"
 
 # Partition dimension: "rows" = output rows of the weight matrix (x @ W^T),
 # "cols" = input/contraction columns of the weight matrix.

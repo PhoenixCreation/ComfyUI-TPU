@@ -18,7 +18,10 @@ PROFILE_NAME = "krea2-1920x1080"
 PROFILE_NAME_DYNAMIC = "krea2"
 PROFILE_PID = "pid"
 PROFILE_PID_ALIAS = "upscaler"
-SUPPORTED_PROFILES = [PROFILE_NAME, PROFILE_NAME_DYNAMIC, PROFILE_PID, PROFILE_PID_ALIAS]
+PROFILE_KREA_PID = "krea2-pid"
+PROFILE_KREA_PID_ALIAS = "krea2_upscaler"
+PROFILE_KREA_PID_ALIAS2 = "krea2-upscaler"
+SUPPORTED_PROFILES = [PROFILE_NAME, PROFILE_NAME_DYNAMIC, PROFILE_PID, PROFILE_PID_ALIAS, PROFILE_KREA_PID, PROFILE_KREA_PID_ALIAS, PROFILE_KREA_PID_ALIAS2]
 
 # Fixed production profile (spec section 4). Prompt text and seed may vary;
 # every value that affects tensor shapes is fixed. Phase 2 keeps the same
@@ -78,6 +81,34 @@ PROFILE_PID_FIXED = {
     "upscale_factor": PID_UPSCALE_FACTOR,
 }
 
+# Krea2 -> PiD fused (1024x576 -> 4096x2304). Krea generates 1024 longest
+# edge 16:9, PiD upscales 4x. Shares all 6 artifacts, single queue item.
+KREA_PID_KREA_WIDTH = 1024
+KREA_PID_KREA_HEIGHT = 576
+KREA_PID_PID_WIDTH = 4096
+KREA_PID_PID_HEIGHT = 2304
+KREA_PID_SAVE_PREFIX = "krea2-pid"
+KREA_PID_SAVE_PREFIX_ALT = "PiD"
+PROFILE_KREA_PID_FIXED = {
+    "krea_width": KREA_PID_KREA_WIDTH,
+    "krea_height": KREA_PID_KREA_HEIGHT,
+    "pid_width": KREA_PID_PID_WIDTH,
+    "pid_height": KREA_PID_PID_HEIGHT,
+    "krea_steps": PROFILE["steps"],
+    "krea_cfg": PROFILE["cfg"],
+    "krea_sampler": PROFILE["sampler_name"],
+    "krea_scheduler": PROFILE["scheduler"],
+    "krea_denoise": PROFILE["denoise"],
+    "pid_steps": PID_STEPS,
+    "pid_cfg": PID_CFG,
+    "pid_sampler": PID_SAMPLER_NAME,
+    "pid_scheduler": PID_SCHEDULER,
+    "pid_denoise": PID_DENOISE,
+    "save_prefix": KREA_PID_SAVE_PREFIX,
+    "save_prefix_alt": KREA_PID_SAVE_PREFIX_ALT,
+    "upscale_factor": PID_UPSCALE_FACTOR,
+}
+
 # PiD latent shapes: input Flux VAE (8x) and output pixel space (1:1).
 PID_INPUT_LATENT_SHAPE = (1, 16, PID_INPUT_HEIGHT // 8, PID_INPUT_WIDTH // 8)  # (1,16,72,128)
 PID_OUTPUT_LATENT_SHAPE = (1, 3, PID_OUTPUT_HEIGHT, PID_OUTPUT_WIDTH)  # (1,3,2304,4096)
@@ -123,16 +154,46 @@ def is_valid_pid_size(width, height, batch_size=1) -> bool:
     Phase A pins exactly 4096x2304x1 (output) derived from 1024x576 input *4.
     The validator checks the *output* geometry because that is the XLA shape;
     the input side is validated indirectly via the fixed upscale factor.
+    For the fused Krea2->PiD flow we also allow the 2048x1152 bucket (512x288 *4)
+    which is a smaller memory alternative that still demonstrates the pipeline.
     """
     if batch_size != PID_BATCH_SIZE:
         return False
     if not isinstance(width, int) or not isinstance(height, int):
         return False
-    if width != PID_OUTPUT_WIDTH or height != PID_OUTPUT_HEIGHT:
-        return False
     if width % PID_DYNAMIC_STEP != 0 or height % PID_DYNAMIC_STEP != 0:
         return False
-    return True
+    # Canonical buckets: 4096x2304 (1024x576*4) and 2048x1152 (512x288*4)
+    if (width == PID_OUTPUT_WIDTH and height == PID_OUTPUT_HEIGHT) or (width == 2048 and height == 1152):
+        return True
+    return False
+
+
+def is_valid_krea_pid_size(krea_w, krea_h, pid_w, pid_h, batch_size=1) -> bool:
+    """Check whether the fused Krea2->PiD sizes are allowed.
+
+    Fixed buckets: Krea 1024x576 -> PiD 4096x2304 (x4) and Krea 512x288 -> PiD
+    2048x1152 (x4, lower memory alternative for v5e-8). The Krea side uses the
+    dynamic contract's step/area but is pinned to those two buckets for now.
+    """
+    if batch_size != PID_BATCH_SIZE:
+        return False
+    # Bucket 1: 1024x576 -> 4096x2304
+    if krea_w == KREA_PID_KREA_WIDTH and krea_h == KREA_PID_KREA_HEIGHT and pid_w == KREA_PID_PID_WIDTH and pid_h == KREA_PID_PID_HEIGHT:
+        if pid_w != krea_w * PID_UPSCALE_FACTOR or pid_h != krea_h * PID_UPSCALE_FACTOR:
+            return False
+        return is_valid_krea2_size(krea_w, krea_h, batch_size) and is_valid_pid_size(pid_w, pid_h, batch_size)
+    # Bucket 2: 512x288 -> 2048x1152 (smaller, fits v5e-8 with both models)
+    if krea_w == 512 and krea_h == 288 and pid_w == 2048 and pid_h == 1152:
+        if pid_w != krea_w * PID_UPSCALE_FACTOR or pid_h != krea_h * PID_UPSCALE_FACTOR:
+            return False
+        # 512x288 is below the generic dynamic area bound but is explicitly allowed for the fused low-memory bucket
+        if krea_w % DYNAMIC_STEP != 0 or krea_h % DYNAMIC_STEP != 0:
+            return False
+        if pid_w % PID_DYNAMIC_STEP != 0 or pid_h % PID_DYNAMIC_STEP != 0:
+            return False
+        return True
+    return False
 
 
 def latent_shape_for_pid(width: int, height: int):
@@ -568,6 +629,240 @@ def _validate_pid_prompt(nodes: Dict) -> tuple:
     return True, None
 
 
+def _validate_krea_pid_prompt(nodes: Dict) -> tuple:
+    """Validate the fused Krea2 -> PiD pipeline.
+
+    Requires both Krea2 and PiD loaders, fixed geometry 1024x576 -> 4096x2304,
+    Krea sampler (er_sde/simple 8) + PiD sampler (lcm/simple 4) and no host
+    dynamic geometry nodes. VAE chain is qwen_image_vae (decode) -> flux1_vae
+    (encode) -> pixel_space (final decode). Single queue item without host PIL.
+    """
+    has_krea_unet = False
+    has_pid_unet = False
+    has_krea_clip = False
+    has_pid_clip = False
+    has_qwen_vae = False
+    has_flux_vae = False
+    has_pixel_vae = False
+    has_empty_latent = False
+    has_empty_chroma = False
+    has_pid_conditioning = False
+    has_krea_sampler = False
+    has_pid_sampler_select = False
+    has_pid_scheduler = False
+    has_pid_sampler_custom = False
+    has_save = False
+    krea_w = krea_h = None
+    pid_w = pid_h = None
+
+    for nid, node in nodes.items():
+        class_type = node.get("class_type", "")
+        inputs = node.get("inputs", {})
+
+        if class_type in _UNSUPPORTED_LOADERS:
+            return False, _error("tpu_profile_unsupported_loader",
+                                 "{} is not supported on TPU: use the native UNETLoader/CLIPLoader/VAELoader "
+                                 "nodes; TPU device placement is process-wide".format(class_type), nid,
+                                 observed=class_type, required="native loader")
+        if class_type in _UNSUPPORTED_MUTATIONS:
+            return False, _error("tpu_profile_unsupported_mutation",
+                                 "{} is not supported on TPU: LoRA, model patches, ControlNet, and "
+                                 "reference-image conditioning are outside the profile".format(class_type),
+                                 nid, observed=class_type, required="no mutations")
+        if class_type in _PID_UNSUPPORTED_DYNAMIC:
+            return False, _error("tpu_profile_dynamic_geometry",
+                                 "{} is not supported on TPU for the fixed {} profile: the canonical fused graph "
+                                 "hardcodes {}x{} -> {}x{}".format(class_type, PROFILE_KREA_PID, KREA_PID_KREA_WIDTH, KREA_PID_KREA_HEIGHT, KREA_PID_PID_WIDTH, KREA_PID_PID_HEIGHT),
+                                 nid, observed=class_type, required="native fixed geometry")
+        for key, value in inputs.items():
+            if isinstance(value, str) and ("cuda" in value.lower() or "xpu" in value.lower()):
+                return False, _error("tpu_profile_cuda_device",
+                                     "{} on node {} requests device '{}'; TPU placement is process-wide and "
+                                     "device widgets are not supported".format(key, nid, value),
+                                     nid, observed=value, required="no explicit device")
+
+        if class_type == "UNETLoader":
+            unet_name = inputs.get("unet_name")
+            if unet_name == "krea2_turbo_bf16.safetensors":
+                has_krea_unet = True
+            elif unet_name == "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors":
+                has_pid_unet = True
+            else:
+                return False, _error("tpu_profile_artifact",
+                                     "diffusion model '{}' is not in the approved manifest; expected "
+                                     "krea2_turbo_bf16.safetensors or pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors".format(unet_name),
+                                     nid, observed=unet_name, required="krea2_turbo_bf16.safetensors|pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors")
+        elif class_type == "CLIPLoader":
+            clip_name = inputs.get("clip_name")
+            clip_type = inputs.get("type")
+            if clip_name == "qwen3vl_4b_bf16.safetensors":
+                has_krea_clip = True
+                if clip_type != "krea2":
+                    return False, _error("tpu_profile_invalid_clip_type",
+                                         "CLIPLoader type must be 'krea2' for qwen3vl in the fused profile",
+                                         nid, observed=clip_type, required="krea2")
+            elif clip_name == "gemma_2_2b_it_elm_bf16.safetensors":
+                has_pid_clip = True
+                if clip_type != "pixeldit":
+                    return False, _error("tpu_profile_invalid_clip_type",
+                                         "CLIPLoader type must be 'pixeldit' for gemma in the fused profile",
+                                         nid, observed=clip_type, required="pixeldit")
+            else:
+                return False, _error("tpu_profile_artifact",
+                                     "text encoder '{}' is not in the approved manifest; expected "
+                                     "qwen3vl_4b_bf16.safetensors or gemma_2_2b_it_elm_bf16.safetensors".format(clip_name),
+                                     nid, observed=clip_name, required="qwen3vl_4b_bf16.safetensors|gemma_2_2b_it_elm_bf16.safetensors")
+        elif class_type == "VAELoader":
+            vae_name = inputs.get("vae_name")
+            if vae_name == "qwen_image_vae.safetensors":
+                has_qwen_vae = True
+            elif vae_name in ("flux1_vae.safetensors", "flux1-vae.safetensors"):
+                has_flux_vae = True
+            elif vae_name == "pixel_space":
+                has_pixel_vae = True
+            else:
+                return False, _error("tpu_profile_artifact",
+                                     "VAE '{}' is not in the approved manifest; expected qwen_image_vae.safetensors, flux1_vae.safetensors or pixel_space".format(vae_name),
+                                     nid, observed=vae_name, required="qwen_image_vae.safetensors|flux1_vae.safetensors|pixel_space")
+        elif class_type == "EmptyLatentImage":
+            has_empty_latent = True
+            w = inputs.get("width")
+            h = inputs.get("height")
+            b = inputs.get("batch_size")
+            krea_w, krea_h = w, h
+            # Allow both 1024x576 and 512x288 (low-memory) buckets
+            if not ((w == KREA_PID_KREA_WIDTH and h == KREA_PID_KREA_HEIGHT) or (w == 512 and h == 288)):
+                return False, _error("tpu_profile_wrong_latent_shape",
+                                     "EmptyLatentImage {}x{} does not satisfy fused profile 1024x576 or 512x288".format(
+                                         w, h),
+                                     nid, observed=f"{w}x{h}", required="1024x576|512x288")
+            if b != PROFILE["batch_size"]:
+                return False, _error("tpu_profile_wrong_batch_size",
+                                     "EmptyLatentImage batch {} does not satisfy fused profile".format(b),
+                                     nid, observed=b, required=PROFILE["batch_size"])
+        elif class_type == "EmptyChromaRadianceLatentImage":
+            has_empty_chroma = True
+            w = inputs.get("width")
+            h = inputs.get("height")
+            b = inputs.get("batch_size", 1)
+            pid_w, pid_h = w, h
+            if not is_valid_pid_size(w, h, b):
+                return False, _error("tpu_profile_wrong_latent_shape",
+                                     "EmptyChromaRadianceLatentImage {}x{} does not satisfy PiD profile 4096x2304 or 2048x1152".format(
+                                         w, h),
+                                     nid, observed=f"{w}x{h}", required="4096x2304|2048x1152")
+        elif class_type == "PiDConditioning":
+            has_pid_conditioning = True
+            if inputs.get("latent_format") != "flux":
+                return False, _error("tpu_profile_invalid_latent_format",
+                                     "PiDConditioning latent_format must be 'flux' for the fused profile",
+                                     nid, observed=inputs.get("latent_format"), required="flux")
+            try:
+                sigma = float(inputs.get("degrade_sigma", 0))
+            except Exception:
+                sigma = None
+            if sigma != 0.0:
+                return False, _error("tpu_profile_wrong_degrade_sigma",
+                                     "PiDConditioning degrade_sigma must be 0 for the fixed fused profile",
+                                     nid, observed=inputs.get("degrade_sigma"), required=0.0)
+        elif class_type == "KSampler":
+            has_krea_sampler = True
+            for field, required in [("steps", PROFILE["steps"]), ("cfg", PROFILE["cfg"]), ("sampler_name", PROFILE["sampler_name"]), ("scheduler", PROFILE["scheduler"]), ("denoise", PROFILE["denoise"])]:
+                observed = inputs.get(field)
+                if observed != required:
+                    return False, _error("tpu_profile_wrong_{}".format(field),
+                                         "{} value {} does not match the fused Krea profile (required: {})".format(
+                                             field, observed, PROFILE_KREA_PID, required),
+                                         nid, observed=observed, required=required)
+        elif class_type == "BasicScheduler":
+            has_pid_scheduler = True
+            if inputs.get("scheduler") != PID_SCHEDULER:
+                return False, _error("tpu_profile_wrong_scheduler",
+                                     "scheduler value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("scheduler"), PROFILE_KREA_PID, PID_SCHEDULER),
+                                     nid, observed=inputs.get("scheduler"), required=PID_SCHEDULER)
+            if inputs.get("steps") != PID_STEPS:
+                return False, _error("tpu_profile_wrong_steps",
+                                     "steps value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("steps"), PROFILE_KREA_PID, PID_STEPS),
+                                     nid, observed=inputs.get("steps"), required=PID_STEPS)
+            if inputs.get("denoise") != PID_DENOISE:
+                return False, _error("tpu_profile_wrong_denoise",
+                                     "denoise value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("denoise"), PROFILE_KREA_PID, PID_DENOISE),
+                                     nid, observed=inputs.get("denoise"), required=PID_DENOISE)
+        elif class_type == "KSamplerSelect":
+            has_pid_sampler_select = True
+            if inputs.get("sampler_name") != PID_SAMPLER_NAME:
+                return False, _error("tpu_profile_wrong_sampler_name",
+                                     "sampler_name value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("sampler_name"), PROFILE_KREA_PID, PID_SAMPLER_NAME),
+                                     nid, observed=inputs.get("sampler_name"), required=PID_SAMPLER_NAME)
+        elif class_type == "SamplerCustom":
+            has_pid_sampler_custom = True
+            if inputs.get("cfg") != PID_CFG:
+                return False, _error("tpu_profile_wrong_cfg",
+                                     "cfg value {} does not match the fixed {} profile (required: {})".format(
+                                         inputs.get("cfg"), PROFILE_KREA_PID, PID_CFG),
+                                     nid, observed=inputs.get("cfg"), required=PID_CFG)
+        elif class_type == "ImageScale":
+            w = inputs.get("width")
+            h = inputs.get("height")
+            if isinstance(w, list) or isinstance(h, list):
+                return False, _error("tpu_profile_dynamic_geometry",
+                                     "ImageScale with wired width/height is not supported on TPU for the fixed {} profile".format(PROFILE_KREA_PID),
+                                     nid, observed=str(w if isinstance(w, list) else h), required=f"{PID_INPUT_WIDTH}x{PID_INPUT_HEIGHT}")
+        elif class_type == "SaveImage":
+            has_save = True
+            prefix = inputs.get("filename_prefix")
+            # Allow any krea2-pid* prefix (covers krea2-pid, krea2-pid-2048 etc) and PiD variants
+            allowed_fused = prefix in (KREA_PID_SAVE_PREFIX, KREA_PID_SAVE_PREFIX_ALT, KREA_PID_SAVE_PREFIX_ALT.lower(), "krea2_upscaler", "krea2-upscaler") or (isinstance(prefix, str) and prefix.startswith("krea2-pid"))
+            allowed_legacy = prefix in (PROFILE["save_prefix"], PID_SAVE_PREFIX, KREA_PID_SAVE_PREFIX, KREA_PID_SAVE_PREFIX_ALT)
+            if not (allowed_fused or allowed_legacy):
+                return False, _error("tpu_profile_wrong_save_prefix",
+                                     "SaveImage prefix '{}' does not match the fused profile prefix '{}' or '{}'".format(
+                                         prefix, KREA_PID_SAVE_PREFIX, KREA_PID_SAVE_PREFIX_ALT),
+                                     nid, observed=prefix, required=f"{KREA_PID_SAVE_PREFIX}|{KREA_PID_SAVE_PREFIX_ALT}|krea2-pid*")
+
+    if not has_krea_unet:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a UNETLoader for krea2_turbo_bf16.safetensors", None, observed="UNETLoader(krea2)", required="krea2_turbo_bf16.safetensors")
+    if not has_pid_unet:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a UNETLoader for pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors", None, observed="UNETLoader(pid)", required="pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors")
+    if not has_krea_clip:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a CLIPLoader for qwen3vl_4b_bf16.safetensors (krea2)", None, observed="CLIPLoader(krea2)", required="qwen3vl_4b_bf16.safetensors")
+    if not has_pid_clip:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a CLIPLoader for gemma_2_2b_it_elm_bf16.safetensors (pixeldit)", None, observed="CLIPLoader(pixeldit)", required="gemma_2_2b_it_elm_bf16.safetensors")
+    if not has_qwen_vae:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a VAELoader for qwen_image_vae.safetensors", None, observed="VAELoader", required="qwen_image_vae.safetensors")
+    if not has_flux_vae:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a VAELoader for flux1_vae.safetensors", None, observed="VAELoader", required="flux1_vae.safetensors")
+    if not has_pixel_vae:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a VAELoader for pixel_space", None, observed="VAELoader", required="pixel_space")
+    if not has_empty_latent:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires an EmptyLatentImage 1024x576", None, observed="EmptyLatentImage", required="EmptyLatentImage")
+    if not has_empty_chroma:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires an EmptyChromaRadianceLatentImage 4096x2304", None, observed="EmptyChromaRadianceLatentImage", required="EmptyChromaRadianceLatentImage")
+    if not has_pid_conditioning:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a PiDConditioning node", None, observed="PiDConditioning", required="PiDConditioning")
+    if not has_krea_sampler:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a KSampler for Krea2 (er_sde simple 8)", None, observed="KSampler", required="KSampler")
+    if not has_pid_scheduler:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a BasicScheduler for PiD (simple 4)", None, observed="BasicScheduler", required="BasicScheduler")
+    if not has_pid_sampler_select:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a KSamplerSelect for PiD (lcm)", None, observed="KSamplerSelect", required="KSamplerSelect")
+    if not has_pid_sampler_custom:
+        return False, _error("tpu_profile_missing_loader", "the fused profile requires a SamplerCustom for PiD (cfg1)", None, observed="SamplerCustom", required="SamplerCustom")
+    if not has_save:
+        return False, _error("tpu_profile_missing_save", "the fused profile requires a SaveImage output node", None)
+    # cross-check upscale factor and bucket
+    if krea_w is not None and pid_w is not None:
+        if not is_valid_krea_pid_size(krea_w, krea_h, pid_w, pid_h):
+            return False, _error("tpu_profile_wrong_latent_shape",
+                                 "fused sizes mismatch: Krea {}x{} *{} != PiD {}x{} ".format(krea_w, krea_h, PID_UPSCALE_FACTOR, pid_w, pid_h),
+                                 None, observed=f"{krea_w}x{krea_h}->{pid_w}x{pid_h}", required="1024x576->4096x2304|512x288->2048x1152")
+    return True, None
+
+
 def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tuple:
     """Validate a submitted prompt against the fixed TPU profile.
 
@@ -592,15 +887,25 @@ def validate_prompt(prompt: Dict, outputs_to_execute: Optional[List[str]]) -> tu
     if not nodes:
         return False, _error("tpu_profile_no_output_nodes", "TPU profile requires at least one output node", None)
 
-    is_pid = _active_profile() in (PROFILE_PID, PROFILE_PID_ALIAS)
-    # Auto-detect PiD graph when profile is not yet configured (e.g. tests that
-    # do not set args.tpu_profile): if the upstream graph contains a PiD
-    # marker node, validate against the PiD profile.
-    if not is_pid:
+    active = _active_profile()
+    is_krea_pid = active in (PROFILE_KREA_PID, PROFILE_KREA_PID_ALIAS, PROFILE_KREA_PID_ALIAS2)
+    is_pid = active in (PROFILE_PID, PROFILE_PID_ALIAS)
+
+    # Auto-detect when profile is not yet configured (e.g. tests that do not
+    # set args.tpu_profile): fused graph has both Krea UNET + PiD marker,
+    # pure PiD has only PiD marker.
+    if not is_pid and not is_krea_pid:
         has_pid_marker = any(n.get("class_type") in ("PiDConditioning", "EmptyChromaRadianceLatentImage") for n in nodes.values())
-        if has_pid_marker:
+        has_krea_unet = any(n.get("class_type") == "UNETLoader" and n.get("inputs", {}).get("unet_name") == "krea2_turbo_bf16.safetensors" for n in nodes.values())
+        has_pid_unet = any(n.get("class_type") == "UNETLoader" and n.get("inputs", {}).get("unet_name") == "pid_1.5_flux1_1024_to_4096_4step_bf16.safetensors" for n in nodes.values())
+        # fused needs both unets + pid marker
+        if has_pid_marker and has_krea_unet and has_pid_unet:
+            is_krea_pid = True
+        elif has_pid_marker:
             is_pid = True
 
+    if is_krea_pid:
+        return _validate_krea_pid_prompt(nodes)
     if is_pid:
         return _validate_pid_prompt(nodes)
     return _validate_krea_prompt(nodes)

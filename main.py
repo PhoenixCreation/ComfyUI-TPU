@@ -531,9 +531,11 @@ def run_tpu_warmup(prompt_server):
 
     readiness.transition("compiling")
     try:
-        # Profile-aware warmup workflow (krea vs pid).
+        # Profile-aware warmup workflow (krea vs pid vs fused).
         profile = getattr(args, "tpu_profile", tpu_profile.PROFILE_NAME)
-        if profile in (tpu_profile.PROFILE_PID, tpu_profile.PROFILE_PID_ALIAS):
+        if profile in (tpu_profile.PROFILE_KREA_PID, tpu_profile.PROFILE_KREA_PID_ALIAS, tpu_profile.PROFILE_KREA_PID_ALIAS2):
+            workflow_file = "Krea2-PiD-tpu.json"
+        elif profile in (tpu_profile.PROFILE_PID, tpu_profile.PROFILE_PID_ALIAS):
             workflow_file = "Upscaler-tpu.json"
         else:
             workflow_file = "Krea2-turbo-tpu.json"
